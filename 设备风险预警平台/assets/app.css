@@ -145,6 +145,7 @@ tr:hover td{background:#f9fcff}
 .pg.on{background:var(--blue-700);border-color:var(--blue-700);color:#fff;font-weight:700}
 .pg:disabled{opacity:.45;cursor:default}
 .pg-ell{color:var(--muted);font-size:12.5px;padding:0 2px}
+.more-row{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px}
 
 /* ---------- 抽屉与遮罩 ---------- */
 .mask{position:fixed;inset:0;background:rgba(8,32,60,.45);display:none;z-index:50}
