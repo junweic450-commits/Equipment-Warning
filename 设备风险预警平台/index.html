@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light" />
+<title>风险概览 · 煤矿排水设备故障风险预警平台</title>
+<link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+<header class="hero">
+  <img class="corp" src="/logo.png" alt="中天合创 葫芦素煤矿" />
+  <h1 class="hero-title">煤矿排水设备故障风险预警平台</h1>
+  <div class="hero-badges">
+    <span class="badge">含工况校准 v5</span>
+    <span class="badge" id="ts">加载中…</span>
+  </div>
+</header>
+
+<!-- 顶部页签由 common.js 统一注入（三个页面共用一份，改名字只改一处） -->
+
+<main>
+  <div class="stats" id="stats"></div>
+
+  <section class="sec">
+    <div class="sec-hd">
+      <div class="sec-title">今天该管哪几台</div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="tip">风险值由两部分合成：<b>设备本身</b>（温度、电流这些实测数据）和
+      <b>现场情况</b>（潮湿、粉尘、淋水、检修次数这些填报内容）。哪一边高，风险都会被抬上去。
+      每台卡片上的「AI 解读」看这台为什么高、怎么降；「校准工况」改现场情况，风险立即重算。
+      共性归因、治理方案、检修排期都在「智能分析」页。</div>
+
+    <div class="grid" id="cards"></div>
+    <div id="cardsPager"></div>
+    <div class="more-row" id="cardsMore"></div>
+  </section>
+</main>
+
+<footer>数据来源：设备台账 + 仿真时序 + HistGradientBoosting 模型　|　智能分析：本地规则引擎 + 云知声 Agent　|　本页只做展示与录入，不训练模型</footer>
+
+<script src="/assets/common.js"></script>
+<script src="/assets/analysis.js"></script>
+<script src="/assets/chat.js"></script>
+<script src="/assets/page-main.js"></script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light" />
+<title>设备台账 · 煤矿排水设备故障风险预警平台</title>
+<link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+<header class="hero">
+  <img class="corp" src="/logo.png" alt="中天合创 葫芦素煤矿" />
+  <h1 class="hero-title">设备台账</h1>
+  <div class="hero-badges">
+    <span class="badge" id="tableCount">加载中…</span>
+    <span class="badge" id="ts">加载中…</span>
+  </div>
+</header>
+
+<!-- 顶部页签由 common.js 统一注入 -->
+
+<main>
+  <section class="sec">
+    <div class="sec-hd">
+      <div class="sec-title">设备信息维护</div>
+      <div class="sec-acts">
+        <button class="btn ghost small" onclick="load()">刷新</button>
+        <button class="btn small" onclick="openForm()">＋ 新增设备</button>
+        <a class="btn ghost small" href="/risk">看智能分析 →</a>
+      </div>
+    </div>
+    <div class="tip">这一页管录入和查找：新增或修改后，下一次仿真（每 15 秒一轮）即按新参数计算；
+      额定电压 / 电流必须大于 0，否则该设备会被仿真跳过、没有实测数据。
+      「解读」看单台为什么高、怎么降，「校准」改潮湿粉尘这些现场填报项。
+      设备多了按每页条数翻页，搜索和分级筛选会一起算页数。</div>
+
+    <div class="filter-row">
+      <input id="devSearch" type="search" placeholder="搜编号 / 名称 / 巷道 / 厂家，如 PU-001" autocomplete="off" />
+      <select id="devLevel" aria-label="按风险分级筛选">
+        <option value="">全部分级</option>
+        <option value="报警">只看报警</option>
+        <option value="预警">只看预警</option>
+        <option value="关注">只看关注</option>
+        <option value="正常">只看正常</option>
+        <option value="无数据">只看无数据</option>
+      </select>
+      <button class="btn ghost small" id="devFilterClear" type="button">清空筛选</button>
+    </div>
+    <div id="tableWrap"></div>
+    <div id="tablePager"></div>
+  </section>
+
+  <section class="sec">
+    <div class="sec-hd">
+      <div class="sec-title">巷道工作环境</div>
+      <div class="sec-acts">
+        <button class="btn ghost small" onclick="saveDefaultEnv()">保存默认温度</button>
+      </div>
+    </div>
+    <div class="tip">巷道基准温度影响「环境严酷度」这一项，改完下一次仿真生效。
+      只想临时调某台设备的工况，用台账行里的「校准」（那部分写进数据库，不动这个配置）。</div>
+    <div class="row2">
+      <div>
+        <label>巷道 → 环境基准温度（℃），保存后写入 sim_config.json</label>
+        <div id="envList"></div>
+        <div class="env-row" style="margin-top:10px">
+          <input id="newTunnel" placeholder="新巷道名称" style="flex:1 1 140px;max-width:200px" />
+          <input id="newTunnelTemp" type="number" step="0.5" value="23" style="max-width:110px" />
+          <button class="btn small" onclick="addTunnel()">添加</button>
+        </div>
+      </div>
+      <div>
+        <label>默认环境温度（未匹配巷道时使用）</label>
+        <input id="defaultEnv" type="number" step="0.5" value="23" style="max-width:140px" />
+        <p class="hint" id="cfgHint"></p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>本页只做展示与录入，不训练模型　|　台账数据仅存于本机 data/equipment.db</footer>
+
+<script src="/assets/common.js"></script>
+<script src="/assets/analysis.js"></script>
+<script src="/assets/chat.js"></script>
+<script src="/assets/page-devices.js"></script>
+</body>
+</html>
