@@ -229,7 +229,6 @@ function drawerHTML(a){
     <div class="btn-row">
       <button class="btn ai" data-ai-adv="${aiEsc(a.code)}">让 AI 补充建议</button>
       <button class="btn ghost" data-ai-ask="${aiEsc(a.code)}">再问一句</button>
-      <button class="btn ghost" data-act="calib" data-code="${aiEsc(a.code)}">改现场填报</button>
       <button class="btn ghost" data-ai-close="1">关闭</button>
     </div>
     <div data-ai-agent></div>`;

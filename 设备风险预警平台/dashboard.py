@@ -14,6 +14,7 @@
                每台卡片上是单台「AI 解读」入口）
     /risk      智能分析：共性归因 / 治理方案 / 检修排期 / 一台一台看 / AI 补充建议
     /devices   设备台账：完整表格（可搜索、按分级筛、每页 24 行可翻页）+ 增删改 + 巷道基准温度
+    /model-center 模型训练中心：运行样本反馈、审核、HGBT 重训练与版本记录
 
 启动：
     python dashboard.py                # 默认 8770 端口，自动打开浏览器
@@ -59,6 +60,7 @@ import ai_analyze
 import ai_model
 import dataset_builder
 import equipment_db
+import model_learning
 
 
 # --------------------------------------------------------------------------
@@ -105,6 +107,7 @@ _ensure(os.path.join("data", "equipment.db"))
 equipment_db.DATA_DIR = os.path.join(BASE_DIR, "data")
 equipment_db.DB_PATH = os.path.join(equipment_db.DATA_DIR, "equipment.db")
 os.makedirs(equipment_db.DATA_DIR, exist_ok=True)
+model_learning.init_db()
 
 
 # --------------------------------------------------------------------------
@@ -397,7 +400,7 @@ def _load_model():
     if not os.path.exists(MODEL_PATH):
         return None
     try:
-        return ai_model.load_model(MODEL_PATH)
+        return ai_model.load_model(model_learning.active_model_path(MODEL_PATH))
     except Exception:
         return None
 
@@ -479,6 +482,11 @@ def _predict_all():
             combined = _combine(raw, cond_risk)
             item["raw_risk"] = round(raw, 4)
             item["risk"] = round(combined, 4)
+            try:
+                model_learning.record_prediction(
+                    dev["code"], row.get("sim_time"), sample, raw, model_learning.active_version())
+            except Exception as snapshot_exc:
+                _audit("MODEL SNAPSHOT ERROR code=%s error=%s" % (dev["code"], snapshot_exc))
             item["level"] = _level(combined)
         except Exception as exc:              # 单台异常不影响整张看板
             item["error"] = str(exc)[:120]
@@ -509,7 +517,8 @@ def _state():
         "devices": devices,
         "counts": counts,
         "model_ready": model_ready,
-        "model_path": MODEL_PATH,
+        "model_path": model_learning.active_model_path(MODEL_PATH),
+        "model_version": model_learning.active_version(),
         "env": _env_state(),
         "calib_path": CALIB_PATH,
         "types": DEVICE_TYPES,
@@ -551,10 +560,34 @@ def _agent_context(payload):
     if code:
         analysis = _analysis(_check_code(code))
         if analysis:
-            return ai_analyze.context_blob(analysis)[:MAX_CONTEXT_CHARS]
+            base = ai_analyze.context_blob(analysis)
+            device = next((d for d in _state().get("devices", []) if d.get("code") == code), {})
+            terms = [str(code), str(device.get("name") or ""), str(device.get("location") or "")]
+            logs = []
+            for term in filter(None, terms):
+                logs = equipment_db.search_work_records(keyword=term, limit=8)
+                if logs:
+                    break
+            if logs:
+                lines = ["【匹配到的工作维修日志（记录原文，不代表已确认原因）】"]
+                lines.extend("%s | %s | %s | 结果：%s" % (
+                    x.get("work_date") or "日期未知", x.get("equipment") or "设备未标注",
+                    x.get("content") or "", x.get("result") or "未填写") for x in logs)
+                base += "\n" + "\n".join(lines)
+            return base[:MAX_CONTEXT_CHARS]
         return ""
     analysis = _analysis(None)
-    return ai_analyze.context_blob(analysis)[:MAX_CONTEXT_CHARS] if analysis else ""
+    if not analysis:
+        return ""
+    base = ai_analyze.context_blob(analysis)
+    logs = equipment_db.search_work_records(limit=12)
+    if logs:
+        lines = ["【最近工作维修日志（记录原文，不代表已确认原因）】"]
+        lines.extend("%s | %s | %s | 结果：%s" % (
+            x.get("work_date") or "日期未知", x.get("equipment") or "设备未标注",
+            x.get("content") or "", x.get("result") or "未填写") for x in logs)
+        base += "\n" + "\n".join(lines)
+    return base[:MAX_CONTEXT_CHARS]
 
 
 def _clean_question(value):
@@ -608,6 +641,109 @@ def _agent_messages(payload):
     messages = agent_gateway.build_messages(
         question, history, _agent_context(payload), mode)
     return question, messages
+
+
+# --------------------------------------------------------------------------
+# 工作日志解析与确认入账（扩展原设备台账，不改变设备资产表结构）
+# --------------------------------------------------------------------------
+_WORK_SPLIT_RE = re.compile(r"(?m)(?=^\s*\d+\s*[、.．)）])")
+_WORK_PLACE_RE = re.compile(r"(?:[一二三四五六七八九十]+盘区(?:泄水巷|回风巷|辅运巷|泵房)|\d{3,4}(?:回风|辅运|库房)|九联巷|水泵房|库房)")
+_WORK_EQUIP_RE = re.compile(r"(?:\d+\s*#?\s*水泵|[一二三四五六七八九十]+号水泵|水泵|开关|馈电|接线盒|移变|电缆|逆止阀|排水管)")
+
+
+def _parse_work_log(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    raw = str(payload.get("text") or "").strip()
+    if not raw:
+        raise ValueError("请先粘贴或上传工作日志内容")
+    if len(raw) > 900000:
+        raise ValueError("工作日志内容过长")
+    chunks = [x.strip() for x in _WORK_SPLIT_RE.split(raw) if x.strip()]
+    # 有编号时忽略“西翼排水工作量:”这类标题前缀，避免生成空标题记录。
+    numbered = [x for x in chunks if re.match(r"^\s*\d+\s*[、.．)）]", x)]
+    if numbered:
+        chunks = numbered
+    elif not chunks:
+        chunks = [raw]
+    out = []
+    for chunk in chunks:
+        # 去掉条目前的序号
+        content = re.sub(r"^\s*\d+\s*[、.．)）]\s*", "", chunk).strip()
+        if not content:
+            continue
+        people = re.findall(r"[（(]([^（）()]{2,80})[）)]", content)
+        workers = "、".join(re.split(r"[，,、\s]+", people[-1].strip())) if people else ""
+        clean_content = re.sub(r"[（(][^（）()]{2,80}[）)]", "", content).strip()
+        places = _WORK_PLACE_RE.findall(clean_content)
+        equipment = list(dict.fromkeys(_WORK_EQUIP_RE.findall(clean_content)))
+        result_terms = [x for x in ("运行正常", "调试正常", "一切正常", "送电正常", "排水正常") if x in clean_content]
+        out.append({
+            "work_date": str(payload.get("work_date") or "").strip(),
+            "location": "、".join(dict.fromkeys(places[:5])),
+            "equipment": "、".join(equipment[:8]),
+            "content": clean_content,
+            "result": "；".join(result_terms),
+            "workers": workers,
+            "source_text": content,
+        })
+    if not out:
+        raise ValueError("没有识别到有效工作事项，请检查日志格式")
+    return {"ok": True, "records": out, "count": len(out)}
+
+
+def _confirm_work_records(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+        raise ValueError("待确认记录格式错误")
+    records = []
+    for item in payload["records"]:
+        if not isinstance(item, dict):
+            continue
+        date_text = str(item.get("work_date") or "").strip()
+        if date_text:
+            _check_date(date_text)
+        def short(k, limit):
+            value = str(item.get(k) or "").strip()
+            if len(value) > limit:
+                raise ValueError("%s不能超过%d个字符" % (k, limit))
+            return value
+        content = short("content", 5000)
+        if not content:
+            continue
+        records.append({
+            "work_date": date_text, "location": short("location", 100),
+            "equipment": short("equipment", 200), "content": content,
+            "result": short("result", 500), "workers": short("workers", 300),
+            "source_text": short("source_text", 5000),
+        })
+    if not records:
+        raise ValueError("请至少选择一条有效记录")
+    with _STORE_LOCK:
+        result = equipment_db.add_work_records(records)
+    _audit("WORK_RECORDS CONFIRM added=%d refreshed=%d" % (result["added"], result["refreshed"]))
+    return {"ok": True, **result, "count": result["added"] + result["refreshed"]}
+
+
+def _update_work_record(payload):
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise ValueError("维护记录编号缺失")
+    with _STORE_LOCK:
+        ok = equipment_db.update_work_record(payload["id"], payload)
+    if not ok:
+        raise ValueError("维护记录不存在或已被删除")
+    _audit("WORK_RECORD UPDATE id=%s" % payload["id"])
+    return {"ok": True}
+
+
+def _delete_work_record(payload):
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise ValueError("维护记录编号缺失")
+    with _STORE_LOCK:
+        ok = equipment_db.delete_work_record(payload["id"])
+    if not ok:
+        raise ValueError("维护记录不存在或已被删除")
+    _audit("WORK_RECORD DELETE id=%s" % payload["id"])
+    return {"ok": True}
 
 
 # --------------------------------------------------------------------------
@@ -781,6 +917,12 @@ PAGES = {
     "/risk.html": ("risk.html", "text/html; charset=utf-8"),
     "/devices": ("devices.html", "text/html; charset=utf-8"),
     "/devices.html": ("devices.html", "text/html; charset=utf-8"),
+    "/model-center": ("model-center.html", "text/html; charset=utf-8"),
+    "/model-center.html": ("model-center.html", "text/html; charset=utf-8"),
+    "/report": ("report.html", "text/html; charset=utf-8"),
+    "/report.html": ("report.html", "text/html; charset=utf-8"),
+    "/assets/report.js": ("assets/report.js", "application/javascript; charset=utf-8"),
+    "/assets/model-center.js": ("assets/model-center.js", "application/javascript; charset=utf-8"),
     "/assets/app.css": ("assets/app.css", "text/css; charset=utf-8"),
     "/assets/common.js": ("assets/common.js", "application/javascript; charset=utf-8"),
     "/assets/analysis.js": ("assets/analysis.js", "application/javascript; charset=utf-8"),
@@ -919,6 +1061,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._fail(exc)
         elif path == "/api/agent/status":
             self._send_json(agent_gateway.status(AGENT_CFG))
+        elif path == "/api/model-center":
+            try:
+                # 进入训练中心时也刷新一次预测快照，确保最新遥测可供工作人员反馈。
+                _predict_all()
+                status = parse_qs(parsed.query).get("status", ["all"])[0]
+                self._send_json({"ok": True, "summary": model_learning.summary(),
+                                 "data": model_learning.list_samples(status=status, limit=500)})
+            except Exception as exc:
+                self._fail(exc)
+        elif path == "/api/daily-report":
+            try:
+                import report_workflow
+                state = _state()
+                self._send_json({"ok": True, **report_workflow.daily_snapshot(state)})
+            except Exception as exc:
+                self._fail(exc)
+        elif path == "/api/work-records":
+            try:
+                q = parse_qs(parsed.query)
+                self._send_json({"ok": True, "records": equipment_db.search_work_records(
+                    keyword=q.get("keyword", [""])[0], field=q.get("field", [""])[0],
+                    value=q.get("value", [""])[0], limit=5000)})
+            except Exception as exc:
+                self._fail(exc)
         else:
             self.send_error(404)
 
@@ -977,7 +1143,26 @@ class Handler(BaseHTTPRequestHandler):
                     payload.get("code") or "-", len(question)))
                 self._agent_sse(messages)
                 return
-            if path == "/api/device":
+            if path == "/api/model-feedback":
+                self._send_json(model_learning.save_feedback(payload))
+            elif path == "/api/daily-report":
+                import report_workflow
+                self._send_json(report_workflow.save_report(payload))
+            elif path == "/api/model-train":
+                self._send_json(model_learning.train_candidate(MODEL_PATH))
+            elif path == "/api/model-publish":
+                self._send_json(model_learning.publish_candidate(payload))
+            elif path == "/api/model-rollback":
+                self._send_json(model_learning.rollback_model(payload))
+            elif path == "/api/work-log/parse":
+                self._send_json(_parse_work_log(payload))
+            elif path == "/api/work-records/confirm":
+                self._send_json(_confirm_work_records(payload))
+            elif path == "/api/work-records/update":
+                self._send_json(_update_work_record(payload))
+            elif path == "/api/work-records/delete":
+                self._send_json(_delete_work_record(payload))
+            elif path == "/api/device":
                 self._send_json(_save_device(payload))
             elif path == "/api/device/delete":
                 self._send_json(_delete_device(payload))

@@ -48,6 +48,41 @@
     </div>
     <div id="tableWrap"></div>
     <div id="tablePager"></div>
+
+    <div class="maintenance-panel" id="workLogSection">
+    <div class="sec-hd">
+      <div class="sec-title">设备维护信息</div>
+      <div class="sec-acts"><span class="badge" id="workRecordCount">加载维护记录…</span></div>
+    </div>
+    <div class="tip">上传 TXT 工作日志或直接粘贴内容。系统按编号拆分事项并提取地点、设备、人员和处理结果；识别结果仅作为草稿，必须人工核对并确认后才会写入数据库。Word 日志可复制正文粘贴。</div>
+    <div class="work-import">
+      <div class="row2">
+        <div><label>工作日期（可选，应用于本次导入的所有记录）</label><input id="workLogDate" type="date" /></div>
+        <div><label>选择 TXT 工作日志</label><input id="workLogFile" type="file" accept=".txt,text/plain" /></div>
+      </div>
+      <label>工作日志内容</label>
+      <textarea id="workLogText" rows="8" placeholder="粘贴工作日志，例如：
+西翼排水工作量:
+1、403回风……（作业人员）
+2、四盘区泄水巷……"></textarea>
+      <div class="btn-row"><button class="btn" type="button" onclick="parseWorkLog()">解析工作日志</button></div>
+    </div>
+    <div id="workPreview"></div>
+    <div class="sub-title">维护历史记录</div>
+    <div class="maintenance-search">
+      <input id="workKeyword" type="search" placeholder="关键词搜索：工作内容、地点、设备、人员、处理结果" />
+      <select id="workField" aria-label="指定字段搜索">
+        <option value="">全部字段</option><option value="work_date">工作日期</option>
+        <option value="location">工作地点</option><option value="equipment">涉及设备</option>
+        <option value="content">工作内容</option><option value="result">处理结果</option>
+        <option value="workers">作业人员</option>
+      </select>
+      <input id="workFieldValue" type="search" placeholder="字段内容（可选）" />
+      <button class="btn small" type="button" onclick="searchWorkRecords()">搜索</button>
+      <button class="btn ghost small" type="button" onclick="resetWorkSearch()">重置</button>
+    </div>
+    <div id="workRecordList"><div class="empty">加载中…</div></div>
+    </div>
   </section>
 
   <section class="sec">

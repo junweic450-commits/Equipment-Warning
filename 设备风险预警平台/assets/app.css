@@ -145,7 +145,6 @@ tr:hover td{background:#f9fcff}
 .pg.on{background:var(--blue-700);border-color:var(--blue-700);color:#fff;font-weight:700}
 .pg:disabled{opacity:.45;cursor:default}
 .pg-ell{color:var(--muted);font-size:12.5px;padding:0 2px}
-.more-row{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px}
 
 /* ---------- 抽屉与遮罩 ---------- */
 .mask{position:fixed;inset:0;background:rgba(8,32,60,.45);display:none;z-index:50}
@@ -273,3 +272,13 @@ footer{text-align:center;color:#7d93aa;font-size:12px;padding:10px 0 26px}
 @media (prefers-reduced-motion:reduce){
   *{animation-duration:.001ms !important;transition-duration:.001ms !important}
 }
+
+/* 工作日志导入与确认 */
+.work-import{display:grid;gap:10px}.work-import textarea{width:100%;min-height:150px;resize:vertical}.work-draft,.work-saved{border:1px solid #dce6f0;border-radius:10px;padding:14px;margin:12px 0;background:#fff}.work-draft-hd,.work-saved-hd{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.work-check{display:flex;align-items:center;gap:6px;font-weight:400}.work-draft input,.work-draft textarea{width:100%;box-sizing:border-box}.work-saved p{white-space:pre-wrap;line-height:1.65;margin:9px 0}.work-result{color:#26734d;font-size:13px}.sub-title{font-weight:700;margin-top:24px;padding-top:14px;border-top:1px solid #e3eaf2}
+
+/* 设备维护历史：与设备信息维护同一区域 */
+.maintenance-panel{margin-top:24px;padding-top:18px;border-top:2px solid #e3eaf2}.maintenance-search{display:grid;grid-template-columns:minmax(220px,2fr) minmax(130px,1fr) minmax(150px,1fr) auto auto;gap:8px;margin:12px 0}.work-meta{font-size:12px;color:#72849a;margin:8px 0}.work-edit{margin-top:12px;padding:12px;background:#f6f9fc;border-radius:8px}.work-edit input,.work-edit textarea{width:100%;box-sizing:border-box;margin:4px 0 10px}.work-saved .btn-row{margin-top:8px}@media(max-width:760px){.maintenance-search{grid-template-columns:1fr 1fr}.maintenance-search input:first-child{grid-column:1/-1}}
+
+/* 模型训练中心 */
+.mc-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.mc-stat{background:#f7fbff;border:1px solid var(--line);border-radius:10px;padding:13px}.mc-stat b{display:block;font-size:25px;color:var(--blue-700)}

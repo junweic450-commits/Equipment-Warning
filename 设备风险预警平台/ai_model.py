@@ -48,7 +48,10 @@ def train_model(X_train, y_train, categorical_feature_names=None,
         class_weight=class_weight,
     )
     model.fit(X_train, y_train)
-    joblib.dump(model, save_path)
+    if save_path:
+        folder = __import__("os").path.dirname(__import__("os").path.abspath(save_path))
+        __import__("os").makedirs(folder, exist_ok=True)
+        joblib.dump(model, save_path)
     return model
 
 
@@ -118,6 +121,32 @@ def get_feature_importance(model, feature_names: list):
     if total > 0:
         gains = gains / total
     return {name: float(value) for name, value in zip(feature_names, gains)}
+
+
+
+def evaluate_model(model, X_test, y_test):
+    """返回可序列化的分类评估指标。"""
+    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+    y_pred = model.predict(X_test)
+    try:
+        y_prob = model.predict_proba(X_test)[:, list(model.classes_).index(1)]
+    except (AttributeError, ValueError, IndexError):
+        y_prob = None
+    auc = None
+    if y_prob is not None and len(set(y_test)) > 1:
+        auc = float(roc_auc_score(y_test, y_prob))
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1]).tolist()
+    return {
+        "samples": int(len(y_test)),
+        "normal": int((y_test == 0).sum()),
+        "fault": int((y_test == 1).sum()),
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+        "roc_auc": auc,
+        "confusion_matrix": cm,
+    }
 
 
 def _evaluate(model, X_test, y_test):

@@ -356,13 +356,13 @@ async function submitForm(){
   const payload = {
     code: get("f_code").trim(),
     name: get("f_name").trim(),
-    type: get("f_type"),
+    type: get("f_type").value,
     location: get("f_location").trim(),
     rated_v: parseFloat(get("f_rated_v")),
     rated_i: parseFloat(get("f_rated_i")),
     rated_p: parseFloat(get("f_rated_p")),
     commission_date: get("f_commission"),
-    status: get("f_status"),
+    status: get("f_status").value,
     maker: get("f_maker").trim(),
     remark: get("f_remark").trim(),
   };
@@ -650,6 +650,8 @@ const NAV_ITEMS = [
   {href: "/", label: "风险概览", title: "今天哪几台最该管，为什么"},
   {href: "/risk", label: "智能分析", title: "全设备归因、治理方案、一台一台看"},
   {href: "/devices", label: "设备台账", title: "录入维护设备信息、巷道环境温度"},
+  {href: "/report", label: "今日报告", title: "核实风险设备、记录故障原因和处理办法"},
+  {href: "/model-center", label: "模型训练中心", title: "人工反馈、训练数据和 HGBT 模型迭代"},
 ];
 
 function injectNav(){

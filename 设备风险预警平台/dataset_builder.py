@@ -137,8 +137,13 @@ def _clean(df):
     return df.reset_index(drop=True)
 
 
-def build_feature_dataset():
-    """组装特征数据集，返回 (df_all, feature_cols, target_col)。"""
+def build_feature_dataset(include_metadata=False):
+    """组装特征数据集，返回 (df_all, feature_cols, target_col)。
+
+    include_metadata=True 时额外保留 _code/_sim_time，用于将人工反馈
+    精确回写到原始遥测样本，避免同一采样点重复计入训练集。
+    默认 False，兼容原有调用方。
+    """
     conn = _connect()
     try:
         equipment = _read_table("equipment", _REQUIRED_EQUIP_COLS, conn)
@@ -171,7 +176,12 @@ def build_feature_dataset():
     df = _add_rolling_features(df)
     df = _clean(df)
 
-    df_all = df[FEATURE_COLS + [TARGET_COL]].copy()
+    columns = FEATURE_COLS + [TARGET_COL]
+    if include_metadata:
+        columns += ["_code", "sim_time"]
+    df_all = df[columns].copy()
+    if include_metadata:
+        df_all = df_all.rename(columns={"sim_time": "_sim_time"})
     return df_all, list(FEATURE_COLS), TARGET_COL
 
 

@@ -50,6 +50,22 @@ CREATE TABLE IF NOT EXISTS equipment(
     created_at      TEXT,
     updated_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS work_records(
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    work_date       TEXT,
+    location        TEXT,
+    equipment       TEXT,
+    content         TEXT NOT NULL,
+    result          TEXT,
+    workers         TEXT,
+    source_text     TEXT,
+    created_at      TEXT NOT NULL,
+    upload_at       TEXT,
+    updated_at      TEXT,
+    duplicate_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_work_records_date ON work_records(work_date);
+CREATE INDEX IF NOT EXISTS idx_work_records_location ON work_records(location);
 """
 
 _CSV_HEADER = ["设备编号", "设备名称", "设备类型", "安装位置", "额定电压(kV)", "额定电流(A)",
@@ -63,7 +79,15 @@ def _conn():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.execute(SCHEMA)
+    c.executescript(SCHEMA)
+    # 兼容此前版本已经创建的维护记录表：仅补充新字段，不改设备资产表。
+    cols = {r[1] for r in c.execute("PRAGMA table_info(work_records)").fetchall()}
+    for name, definition in (("upload_at", "TEXT"), ("updated_at", "TEXT"),
+                             ("duplicate_count", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in cols:
+            c.execute(f"ALTER TABLE work_records ADD COLUMN {name} {definition}")
+    c.execute("UPDATE work_records SET upload_at=COALESCE(upload_at, created_at)")
+    c.execute("UPDATE work_records SET updated_at=COALESCE(updated_at, created_at)")
     try:
         yield c
         c.commit()
@@ -151,6 +175,101 @@ def delete_device(code):
     with _conn() as c:
         cur = c.execute("DELETE FROM equipment WHERE code=?", (code,))
     return cur.rowcount > 0
+
+
+def _norm_work_value(value):
+    """重复判断时统一空白与常见标点，不做模糊匹配。"""
+    import re
+    value = str(value or "").strip().lower()
+    return re.sub(r"[\s，,。；;、:：()（）\[\]【】]", "", value)
+
+
+def add_work_records(records):
+    """确认后写入维护历史。完全重复的记录不新增，只刷新上传时间。"""
+    ids, added, refreshed = [], 0, 0
+    now = _now()
+    keys = ("work_date", "location", "equipment", "content", "result", "workers")
+    with _conn() as c:
+        for item in records:
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            values = {k: str(item.get(k) or "").strip() for k in keys}
+            # 先按日期检索候选，再在 Python 中做标准化精确比较，避免相似内容误判。
+            candidates = c.execute(
+                "SELECT * FROM work_records WHERE COALESCE(work_date,'')=?",
+                (values["work_date"],)).fetchall()
+            duplicate = None
+            source_text = str(item.get("source_text") or content).strip()
+            for row in candidates:
+                same_fields = all(_norm_work_value(row[k]) == _norm_work_value(values[k]) for k in keys)
+                # 即使用户后来编辑过展示字段，重复上传原始日志时仍可用原文识别，且绝不覆盖人工修改。
+                same_source = _norm_work_value(row["source_text"]) == _norm_work_value(source_text)
+                if same_fields or (source_text and same_source):
+                    duplicate = row
+                    break
+            if duplicate:
+                c.execute("UPDATE work_records SET upload_at=?, duplicate_count=COALESCE(duplicate_count,0)+1 WHERE id=?",
+                          (now, duplicate["id"]))
+                ids.append(duplicate["id"]); refreshed += 1
+                continue
+            cur = c.execute(
+                """INSERT INTO work_records
+                   (work_date, location, equipment, content, result, workers, source_text, created_at, upload_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (values["work_date"] or None, values["location"] or None,
+                 values["equipment"] or None, content, values["result"] or None,
+                 values["workers"] or None, source_text, now, now, now))
+            ids.append(cur.lastrowid); added += 1
+    return {"ids": ids, "added": added, "refreshed": refreshed}
+
+
+def search_work_records(keyword=None, field=None, value=None, limit=1000):
+    """支持全字段关键词检索及指定字段检索。"""
+    fields = {"work_date":"work_date", "location":"location", "equipment":"equipment",
+              "content":"content", "result":"result", "workers":"workers"}
+    clauses, args = [], []
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        clauses.append("(" + " OR ".join(f"COALESCE({k},'') LIKE ?" for k in fields.values()) + ")")
+        args.extend([like] * len(fields))
+    if value and field in fields:
+        clauses.append(f"COALESCE({fields[field]},'') LIKE ?")
+        args.append(f"%{value.strip()}%")
+    sql = "SELECT * FROM work_records" + (" WHERE " + " AND ".join(clauses) if clauses else "")
+    sql += " ORDER BY COALESCE(work_date,'') DESC, id DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 5000)))
+    with _conn() as c:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+
+def update_work_record(record_id, data):
+    allowed = {"work_date", "location", "equipment", "content", "result", "workers"}
+    values = {k: str(data.get(k) or "").strip() for k in allowed}
+    if not values["content"]:
+        raise ValueError("工作内容不能为空")
+    if values["work_date"]:
+        try:
+            datetime.strptime(values["work_date"], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("工作日期格式应为 YYYY-MM-DD")
+    values["updated_at"] = _now()
+    sets = ",".join(f"{k}=?" for k in values)
+    with _conn() as c:
+        cur = c.execute(f"UPDATE work_records SET {sets} WHERE id=?",
+                         list(values.values()) + [int(record_id)])
+    return cur.rowcount > 0
+
+
+def delete_work_record(record_id):
+    with _conn() as c:
+        cur = c.execute("DELETE FROM work_records WHERE id=?", (int(record_id),))
+    return cur.rowcount > 0
+
+
+def get_work_records(limit=300):
+    """获取最近工作维护记录。"""
+    return search_work_records(limit=limit)
 
 
 def export_csv(path=None):
