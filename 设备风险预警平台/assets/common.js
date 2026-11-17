@@ -12,8 +12,10 @@ const S = {
   cfg: {cardPage: 0, rowPage: 0, fullTable: false, env: false},
   tblQ: "",            // 台账搜索词（编号 / 名称 / 巷道 / 类型）
   tblLevel: "",        // 台账分级筛选，空 = 全部
-  pager: {cards: {page: 1, size: 12}, table: {page: 1, size: 24}},
-  hooks: {onState: []},
+  pager: {cards: {page: 1, size: 12}, table: {page: 1, size: 24}, ai: {page: 1, size: 12}},
+  hooks: {onState: [], onRender: []},
+  // 导入抽屉的临时状态：文件原文只在内存里，服务端预检过了才允许真写
+  imp: {text: "", name: "", summary: null, canApply: false, phase: "idle"},
 };
 
 /* 所有写进 innerHTML 的服务端数据都要过这里，防止台账/巷道名里带标签造成 XSS */
@@ -42,6 +44,35 @@ async function api(path, options){
   return data;
 }
 
+/* ---------------------------------------------------------------- 跨页签同步 */
+/* 台账一改，另外两个页签（风险概览 / 智能分析）要立刻跟上。只靠 15 秒轮询不够：
+   浏览器会把后台页签的定时器压到几乎不跑，导完切回概览页看到的还是导入前的数字。
+   BroadcastChannel 可用就用它，不可用退回 localStorage 的 storage 事件，效果一样。 */
+const SYNC_KEY = "pex.ledger.changed";
+let syncChannel = null;
+try{
+  syncChannel = (typeof BroadcastChannel === "function") ? new BroadcastChannel("pex") : null;
+}catch(e){ syncChannel = null; }
+
+function broadcastChange(){
+  if (syncChannel){ try{ syncChannel.postMessage("changed"); }catch(e){ /* 广播失败不影响本页 */ } return; }
+  try{ localStorage.setItem(SYNC_KEY, String(Date.now())); }catch(e){ /* 隐私模式忽略 */ }
+}
+
+function watchRemoteChange(){
+  if (syncChannel){
+    syncChannel.onmessage = () => { load(); };
+    return;
+  }
+  window.addEventListener("storage", e => { if (e.key === SYNC_KEY) load(); });
+}
+
+/* 所有写接口成功后统一走这里：本页立刻重拉 + 通知其它页签 */
+function changed(){
+  broadcastChange();
+  return load();
+}
+
 /* ---------------------------------------------------------------- 状态加载 */
 async function load(){
   try{
@@ -67,6 +98,9 @@ function render(){
   renderTable();
   renderFormOptions(s);
   if (S.cfg.env) renderEnv(s);
+  // 智能分析面板归 analysis.js 自己画，但它那台「一台一台看」的分页也走这里那套
+  // 分页控件，所以整页重绘后要叫它一声，不然翻页点了没反应（不直接 import，避免互相依赖）
+  S.hooks.onRender.forEach(fn => { try{ fn(); }catch(e){ console.error(e); } });
 }
 
 function renderStats(s){
@@ -113,7 +147,7 @@ function cardHTML(d){
       <div><i>距上次检修</i><br>${fmt(t.since_repair_hours, 0, "h")}</div>
     </div>
     ${d.error ? `<p class="hint" style="color:#a8322a">预测失败：${esc(d.error)}</p>` : ""}
-    ${t.sim_time ? `<p class="hint">最新数据：${esc(t.sim_time)}</p>` : `<p class="hint">暂无运行数据，请先跑仿真</p>`}
+    ${t.sim_time ? `<p class="hint">最新数据：${esc(t.sim_time)}</p>` : `<p class="hint">暂无运行记录，这台只按现场情况评级</p>`}
     <button class="ai-btn" data-act="ai" data-code="${esc(d.code)}">AI 解读</button>
     <button class="calib-btn" data-act="calib" data-code="${esc(d.code)}">校准工况</button>
   </div>`;
@@ -341,7 +375,7 @@ async function delDevice(code, name){
     await api("/api/device/delete", {method: "POST", headers: {"Content-Type": "application/json"},
                                      body: JSON.stringify({code: code})});
     closeForm();
-    load();
+    changed();
   }catch(e){ alert(e.message); }
 }
 
@@ -370,7 +404,7 @@ async function submitForm(){
     await api("/api/device", {method: "POST", headers: {"Content-Type": "application/json"},
                               body: JSON.stringify(payload)});
     closeForm();
-    load();
+    changed();
   }catch(e){
     const box = byId("formErr");
     box.style.display = "block";
@@ -383,7 +417,7 @@ async function saveEnv(tunnel, value){
   try{
     await api("/api/env", {method: "POST", headers: {"Content-Type": "application/json"},
                            body: JSON.stringify({tunnel: tunnel, temp: parseFloat(value)})});
-    load();
+    changed();
   }catch(e){ alert(e.message); }
 }
 
@@ -399,7 +433,7 @@ async function delTunnel(tunnel){
   try{
     await api("/api/env/delete", {method: "POST", headers: {"Content-Type": "application/json"},
                                   body: JSON.stringify({tunnel: tunnel})});
-    load();
+    changed();
   }catch(e){ alert(e.message); }
 }
 
@@ -407,7 +441,7 @@ async function saveDefaultEnv(){
   try{
     await api("/api/env/default", {method: "POST", headers: {"Content-Type": "application/json"},
                                    body: JSON.stringify({temp: parseFloat(byId("defaultEnv").value)})});
-    load();
+    changed();
   }catch(e){ alert(e.message); }
 }
 
@@ -481,7 +515,7 @@ async function submitCalib(){
     const res = await api("/api/calibration", {method: "POST",
       headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)});
     byId("calibPreview").innerHTML = factorTable(res.items, res.cond_risk || 0);
-    await load();
+    await changed();
     openCalib(S.calibCode);
   }catch(e){
     const box = byId("calibErr");
@@ -495,8 +529,250 @@ async function resetCalib(){
     await api("/api/calibration/reset", {method: "POST",
       headers: {"Content-Type": "application/json"}, body: JSON.stringify({code: S.calibCode})});
   }catch(e){ alert(e.message); }
-  await load();
+  await changed();
   openCalib(S.calibCode);
+}
+
+/* ---------------------------------------------------------------- 台账导入 */
+/* 台账是唯一一份、导错了没法还原的资产，所以导入分两步：
+   先 dry_run 预检（服务端只读不写，把「新增几台 / 覆盖几台 / 哪几行有问题 /
+   几台会没有实测数据」摆出来），用户看清了再点「确认导入」真写。
+   文件由浏览器读出来再 POST，服务端不落地临时文件。 */
+const IMPORT_MAX_BYTES = 900000;      // 服务端请求体上限 1 MB，留点余量提前挡下来说清楚
+/* .xlsx 是二进制，base64 之后体积涨 4/3，能在浏览器里读的原始大小就比 CSV 小一圈。
+   真台账都在几十 KB 量级，大到超这个数的多半是整本工作簿（几十个 sheet）而不是台账那页。 */
+const IMPORT_MAX_XLSX_BYTES = 700000;
+
+function openImport(){
+  if (!has("importDrawer")) return;
+  S.imp = {text: "", xlsx: "", name: "", summary: null, canApply: false, phase: "idle"};
+  byId("importErr").style.display = "none";
+  byId("importPreview").innerHTML = "";
+  byId("importFile").value = "";
+  closeAll();
+  openDrawer("importDrawer");
+  paintImport();
+}
+
+function closeImport(){ closeDrawer("importDrawer"); }
+
+/* 出错就回到「还没预检过」：确认导入必须重新预检才能点，避免拿着旧结果反复写库 */
+function importError(msg){
+  const box = byId("importErr");
+  box.style.display = "block";
+  box.textContent = msg;
+  S.imp.summary = null;
+  S.imp.canApply = false;
+  S.imp.phase = "idle";
+  byId("importPreview").innerHTML = "";
+  paintImport();
+}
+
+/* Excel 在中文 Windows 上另存的 CSV 常常是 GBK，按 UTF-8 解出来满屏乱码，
+   看到替换符就换 GB18030 重读一次，别让现场拿一份乱码文件去预检。 */
+function readCsvFile(file){
+  return new Promise((resolve, reject) => {
+    const fail = () => reject(new Error("文件读不出来，检查它是不是正被 Excel 占用"));
+    const retry = () => {
+      const fr = new FileReader();
+      fr.onerror = fail;
+      fr.onload = () => resolve(String(fr.result || ""));
+      try{
+        fr.readAsText(file, "gb18030");
+      }catch(e){
+        reject(new Error("这个浏览器读不了 GBK 编码的 CSV，请在 Excel 里另存为「CSV UTF-8」再导"));
+      }
+    };
+    const fr = new FileReader();
+    fr.onerror = fail;
+    fr.onload = () => {
+      const text = String(fr.result || "");
+      if (text.indexOf("\ufffd") >= 0){ retry(); return; }
+      resolve(text);
+    };
+    fr.readAsText(file, "utf-8");
+  });
+}
+
+/* ArrayBuffer → base64。分块拼是因为 String.fromCharCode.apply 一次塞几十万个字节
+   会直接爆栈，而现场那份带格式的表恰好就有多大。 */
+function bufToBase64(buf){
+  const bytes = new Uint8Array(buf);
+  const CH = 0x8000;
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += CH){
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+  }
+  return btoa(bin);
+}
+
+function readXlsxFile(file){
+  return file.arrayBuffer().then(bufToBase64).catch(() => {
+    throw new Error("文件读不出来，检查它是不是正被 Excel 占用（Excel 开着同一份文件时读不到）");
+  });
+}
+
+/* 扩展名不能信：现场那份「设备表.xlsx」可能是文本，也可能是 97-2003 的老 .xls，
+   只是手抖改了个名字。所以读头 4 个字节判内容 —— "PK" 是 xlsx（本质是个 zip），
+   D0 CF 11 E0 是老 .xls（这种 Excel 直接读会报一堆乱码，得让它知道怎么补救），
+   其余都按 CSV 文本走服务端那套分隔符嗅探。 */
+const XLS_MAGIC = [0xd0, 0xcf, 0x11, 0xe0];
+
+async function pickImportFile(){
+  const input = byId("importFile");
+  const f = input.files && input.files[0];
+  S.imp.text = "";
+  S.imp.xlsx = "";
+  S.imp.name = "";
+  S.imp.summary = null;
+  S.imp.canApply = false;
+  S.imp.phase = "idle";
+  if (!f){ byId("importPreview").innerHTML = ""; paintImport(); return; }
+  let head;
+  try{
+    head = new Uint8Array(await f.slice(0, 4).arrayBuffer());
+  }catch(e){
+    input.value = "";
+    importError("文件读不出来，检查它是不是正被 Excel 占用");
+    return;
+  }
+  const isXlsx = head[0] === 0x50 && head[1] === 0x4b;
+  if (!isXlsx && XLS_MAGIC.every((b, i) => head[i] === b)){
+    input.value = "";
+    importError("这是 Excel 97-2003 的 .xls，系统读不了这么老的格式。" +
+                "请在 Excel 里「文件 → 另存为」，类型选 Excel 工作簿 (.xlsx) 或 CSV UTF-8 再导。");
+    return;
+  }
+  const cap = isXlsx ? IMPORT_MAX_XLSX_BYTES : IMPORT_MAX_BYTES;
+  if (f.size > cap){
+    input.value = "";
+    importError("这个文件有 " + (f.size / 1048576).toFixed(1) + " MB，一次导不完。" +
+                (isXlsx ? "Excel 一次只读第一个工作表，且最多 500 行；" : "") +
+                "请在 Excel 里拆成几份（每份不超过 500 行）分次导。");
+    return;
+  }
+  try{
+    if (isXlsx) S.imp.xlsx = await readXlsxFile(f);
+    else S.imp.text = await readCsvFile(f);
+    S.imp.name = f.name;
+    byId("importErr").style.display = "none";
+    byId("importPreview").innerHTML =
+      `<p class="hint">已读取 ${esc(f.name)}（${(f.size / 1024).toFixed(0)} KB` +
+      (isXlsx ? "，Excel 原文件，只读第一个工作表" : "") +
+      `），点「预检」看会改成什么样。</p>`;
+  }catch(e){
+    input.value = "";
+    importError(e.message);
+  }
+  paintImport();
+}
+
+/* 一份文件只落一种形态：Excel 传 base64 由服务端 openpyxl 解，其余传文本。
+   预检和确认导入必须用同一个口径拼，否则预检看的是 A 文件、写的是 B 文件。 */
+function impPicked(){ return !!(S.imp.text || S.imp.xlsx); }
+
+function impBody(dry){
+  const body = {mode: byId("importMode").value, dry_run: dry};
+  if (S.imp.xlsx) body.xlsx_b64 = S.imp.xlsx;
+  else body.text = S.imp.text;
+  return JSON.stringify(body);
+}
+
+async function checkImport(){
+  if (!impPicked()){ importError("先选择要导入的文件（Excel 的 .xlsx 或 CSV）。"); return; }
+  if (S.imp.phase === "checking" || S.imp.phase === "writing") return;
+  S.imp.phase = "checking";
+  paintImport();
+  try{
+    const r = await api("/api/device/import", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: impBody(true),
+    });
+    S.imp.summary = r;
+    S.imp.canApply = (r.added + r.updated) > 0;
+    S.imp.phase = "ready";
+    byId("importErr").style.display = "none";
+  }catch(e){
+    importError(e.message);
+    return;
+  }
+  paintImport();
+}
+
+async function runImport(){
+  if (!S.imp.canApply || S.imp.phase === "writing") return;
+  S.imp.phase = "writing";
+  paintImport();
+  try{
+    const r = await api("/api/device/import", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: impBody(false),
+    });
+    S.imp.summary = r;
+    S.imp.canApply = false;          // 一份文件只让导一次，要再导得重新预检
+    S.imp.phase = "done";
+    S.imp.text = "";
+    S.imp.xlsx = "";
+    byId("importFile").value = "";
+    // 本页立刻重画，另外两个页签（风险概览 / 智能分析）同时收到广播
+    await changed();
+  }catch(e){
+    /* 服务端逐条写入，失败时前面的行已经落库，所以这里也要刷新一遍状态，
+       否则看板还停在导入前，看着像「导入失败 = 什么都没改」。 */
+    S.imp.phase = "idle";
+    importError("导入中断：" + e.message +
+                "　已经写进去的部分不会回滚，风险概览已按当前台账刷新，请核对后重新预检。");
+    await changed();
+  }
+  paintImport();
+}
+
+/* 按钮可用性和预检结果都只从 S.imp 这一份状态推导，不在各处手改 textContent。 */
+function paintImport(){
+  const check = byId("btnImportCheck"), go = byId("btnImportGo");
+  if (!check || !go) return;
+  const p = S.imp.phase;
+  const busy = p === "checking" || p === "writing";
+  check.disabled = busy || !impPicked();
+  check.textContent = p === "checking" ? "预检中…" : "预检";
+  go.disabled = p !== "ready" || !S.imp.canApply;
+  go.textContent = p === "writing" ? "导入中…" : (p === "done" ? "已导入" : "确认导入");
+  if (S.imp.summary) byId("importPreview").innerHTML = importSummaryHTML(S.imp.summary, p === "done");
+}
+
+function importSummaryHTML(r, done){
+  const o = r.overview || null;
+  const badColor = r.failed ? "var(--red)" : "#6b829c";
+  const errs = (r.errors || []).map(e =>
+    `<li class="ai-item"><div class="t">第 ${esc(e.line)} 行 · ${esc(e.code)}</div>
+       <div class="d">${esc(e.reason)}</div></li>`).join("");
+  return `<div class="ai-panel" style="margin:12px 0 0">
+    <div class="ai-hd"><span class="ai-tag">${done ? "导入完成" : "预检结果"}</span>
+      <span class="hint" style="margin:0">${esc(S.imp.name || "")}
+        分隔符 ${esc(r.delimiter)}　识别 ${r.total} 行</span></div>
+    <div class="ai-nums">
+      <div class="ai-num"><b>${r.added}</b>新增台</div>
+      <div class="ai-num"><b>${r.updated}</b>覆盖台</div>
+      <div class="ai-num"><b>${r.skipped}</b>跳过台</div>
+      <div class="ai-num"><b style="color:${badColor}">${r.failed}</b>行有问题</div>
+      <div class="ai-num"><b style="color:#8a97a8">${r.no_data}</b>没有实测</div>
+    </div>
+    ${!done && !S.imp.canApply && !r.failed
+      ? `<p class="hint">这份文件里没有要新增或覆盖的设备（都是已存在且选了「跳过」），
+          不用导入。</p>` : ""}
+    ${r.unknown && r.unknown.length
+      ? `<p class="hint">这几列系统不认识，已忽略：${esc(r.unknown.join("、"))}</p>` : ""}
+    ${errs ? `<div class="ai-block"><h5 style="margin:8px 0 6px">有问题的行${r.errors_hidden ? "（列了 " + r.errors.length + " 条，另有 " + r.errors_hidden + " 条没显示）" : ""}</h5>
+        <ul class="ai-list">${errs}</ul></div>` : ""}
+    ${r.no_data ? `<p class="hint">其中 ${r.no_data} 台还没有运行记录，导进来先按「无数据」灰点显示；
+        接入采集数据或补上历史记录后，分级会自动出来。风险数值不会因为这些设备没有数据而失真。</p>` : ""}
+    ${o ? `<p class="hint">风险概览已同步：现在共 ${o.total} 台 ——
+        报警 ${o.counts.red || 0}、预警 ${o.counts.orange || 0}、关注 ${o.counts.yellow || 0}、
+        正常 ${o.counts.green || 0}、无数据 ${o.counts.gray || 0}。
+        平均风险 ${o.mean_risk === null || o.mean_risk === undefined ? "—" : (o.mean_risk * 100).toFixed(1) + "%"}。</p>` : ""}
+    ${!done && r.failed ? `<p class="hint">有问题的行这次不会写入，其余行照常导入。
+        要一行都不丢，请先在 Excel 里按上面的行号改完再导。</p>` : ""}
+  </div>`;
 }
 
 /* ---------------------------------------------------------------- 抽屉管理 */
@@ -512,7 +788,21 @@ function openDrawer(id){
   byId("mask").classList.add("on");
   byId(id).classList.add("on");
   OPEN_DRAWERS.add(id);
+  restackDrawers();
   syncFab();
+}
+
+/* 四个抽屉在 CSS 里同为 z-index:51，分层只能按 DOM 注入顺序定 —— aiDrawer 是
+   analysis.js 最后注入的，于是从「解读」里点「改现场填报」，新开的校准抽屉整个压在
+   解读抽屉底下：按钮点不到，看着就像控件失效。Set 的插入序就是打开序
+   （重开会 delete+add 移到末尾），按它重排成"后开的在上"。
+   最高只到 51+4，仍低于 QA 面板和悬浮球的 60，不会把问答压住。 */
+function restackDrawers(){
+  let z = 51;
+  OPEN_DRAWERS.forEach(id => {
+    const el = byId(id);
+    if (el) el.style.zIndex = String(++z);
+  });
 }
 
 function closeDrawer(id){
@@ -524,7 +814,7 @@ function closeDrawer(id){
 }
 
 function closeAll(){
-  ["drawer", "calibDrawer", "aiDrawer"].forEach(id => {
+  ["drawer", "calibDrawer", "aiDrawer", "importDrawer"].forEach(id => {
     const el = byId(id);
     if (el) el.classList.remove("on");
   });
@@ -607,7 +897,7 @@ const CHROME_HTML = `
 </aside>
 <aside class="drawer" id="drawer">
   <h2 id="formTitle">新增设备</h2>
-  <p class="hint">编号保存后不可修改；额定电压/电流必须大于 0，否则仿真会跳过该设备。</p>
+  <p class="hint">编号保存后不可修改；额定电压/电流必须大于 0，填 0 会带着 0 去算风险。</p>
   <div id="formErr" class="warn" style="display:none"></div>
   <label>设备编号 *</label><input id="f_code" placeholder="如 PU-002" />
   <label>设备名称 *</label><input id="f_name" placeholder="如 2#排水泵" />
@@ -630,6 +920,30 @@ const CHROME_HTML = `
     <button class="btn" onclick="submitForm()">保存</button>
     <button class="btn ghost" onclick="closeForm()">取消</button>
     <button class="btn danger" id="btnDelDevice" style="display:none" onclick="deleteCurrent()">删除设备</button>
+  </div>
+</aside>
+<aside class="drawer" id="importDrawer">
+  <h2>导入台账</h2>
+  <p class="hint">直接选 Excel 存的 .xlsx 原文件就行，也可以选 CSV（逗号 / 分号 / Tab / 竖线
+    分隔，GBK 编码的也认）。表头认中文也认英文，设备编号 / 设备名称 / 设备类型 三列必须有，
+    一次最多 500 行；.xlsx 有多张工作表时只读第一张。
+    先点「预检」看会改成什么样，确认没问题再点「确认导入」。</p>
+  <div id="importErr" class="warn" style="display:none"></div>
+  <label>选择 Excel / CSV 文件 *</label>
+  <input id="importFile" type="file"
+         accept=".xlsx,.csv,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+         onchange="pickImportFile()" />
+  <label>编号已在台账里时</label>
+  <select id="importMode">
+    <option value="upsert">覆盖台账里这台同编号设备</option>
+    <option value="skip">跳过，保留台账里已有的信息</option>
+  </select>
+  <div id="importPreview"></div>
+  <div class="btn-row">
+    <button class="btn ghost" id="btnImportCheck" type="button" onclick="checkImport()" disabled>预检</button>
+    <button class="btn" id="btnImportGo" type="button" onclick="runImport()" disabled>确认导入</button>
+    <a class="btn ghost" href="/api/device/template.csv" download>下载模板</a>
+    <button class="btn ghost" type="button" onclick="closeImport()">关闭</button>
   </div>
 </aside>
 <aside class="drawer" id="aiDrawer" data-ai-scope="1"></aside>`;
@@ -679,18 +993,24 @@ function boot(cfg){
   bindDelegates();
   bindPager();
   bindTableFilter();
+  watchRemoteChange();
   load();
   setInterval(load, 15000);
+  // 切走标签页时浏览器会把 15 秒定时器压到几乎不跑，回到页面往往看到的是旧快照。
+  // 补一次「切回来立刻拉新数据」，现场演示切屏回来数字就是当前这一轮的。
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
   if (window.SmartAnalysis) SmartAnalysis.mountAll();
   if (window.QA) QA.mount();
 }
 
 const App = {
   boot, load, esc, fmt, byId, has, api, factorTable, openDrawer, closeDrawer, closeAll,
+  paginate, pagerHTML,
   state: () => S.state,
   cfg: () => S.cfg,
   device: code => (S.state ? S.state.devices.find(d => d.code === code) : null),
   onState: fn => S.hooks.onState.push(fn),
+  onRender: fn => S.hooks.onRender.push(fn),
   openCalib, openForm,
 };
 window.App = App;

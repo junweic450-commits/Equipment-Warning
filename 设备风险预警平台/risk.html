@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="light" />
 <title>智能分析 · 煤矿排水设备故障风险预警平台</title>
+<link rel="icon" href="/logo.png" type="image/png" />
 <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
@@ -24,11 +25,15 @@
     <div class="sec-hd">
       <div class="sec-title">这一轮分析</div>
       <div class="sec-acts">
-        <button class="btn ghost small" onclick="SmartAnalysis.refresh()">重新分析</button>
+        <button class="btn ghost small" id="btnReanalyze" type="button" onclick="SmartAnalysis.refresh(this)">重新分析</button>
+        <a class="btn ghost small" href="/api/export?type=devices" download>导出风险清单</a>
+        <a class="btn ghost small" href="/api/export?type=actions" download>导出治理措施</a>
+        <a class="btn ghost small" href="/api/export?type=plan" download>导出检修排期</a>
       </div>
     </div>
     <div class="tip">这一页只讲「为什么高、先干什么」，风险数字本身在首页和设备台账里看。
       下面每一项都是按看板同一套风险公式逐项拆出来的，「降多少个百分点」是重算的结果，不是估算。
+      改完台账或校准后点「重新分析」，标题右侧的「本轮数据」时间跟着变，就说明这一轮已经重算过。
       要文字版建议或追问原因，点「让 AI 补充建议」或右下角的「问 AI」。</div>
 
     <div data-ai="full"></div>

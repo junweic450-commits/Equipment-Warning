@@ -94,6 +94,9 @@ button{cursor:pointer;font-family:inherit}
 .btn.danger:hover{filter:brightness(1.1)}
 .btn.small{padding:5px 10px;font-size:12px}
 .btn:disabled{opacity:.5;cursor:not-allowed}
+/* 导出用的链接做成按钮样子：a 默认带下划线，不抹掉会和按钮并排时明显不齐 */
+a.btn{display:inline-block;text-decoration:none;line-height:1.4}
+a.btn:hover{filter:brightness(1.06)}
 .btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 input,select,textarea{width:100%;padding:8px 10px;border:1px solid #cfdff0;border-radius:8px;
   font-size:13px;font-family:inherit;background:#fff;color:var(--tx)}
@@ -149,7 +152,9 @@ tr:hover td{background:#f9fcff}
 /* ---------- 抽屉与遮罩 ---------- */
 .mask{position:fixed;inset:0;background:rgba(8,32,60,.45);display:none;z-index:50}
 .mask.on{display:block}
-.drawer{position:fixed;top:0;right:0;height:100%;width:min(480px,100vw);background:#fff;z-index:51;
+/* 这里一律用 100%（相对固定定位的包含块，已扣掉滚动条），不用 100vw：
+   100vw 含滚动条宽度，窄屏上抽屉会整体左溢十几像素，左边框被裁掉。 */
+.drawer{position:fixed;top:0;right:0;height:100%;width:min(480px,100%);background:#fff;z-index:51;
   transform:translateX(102%);transition:.22s;padding:22px clamp(16px,2vw,24px);overflow:auto;
   box-shadow:-12px 0 30px rgba(8,32,60,.18)}
 .drawer.on{transform:none}
@@ -166,6 +171,19 @@ tr:hover td{background:#f9fcff}
 .ai-status i{width:8px;height:8px;border-radius:50%;background:var(--gray);display:inline-block}
 .ai-status i.on{background:var(--green)}
 .ai-status i.off{background:var(--orange)}
+/* 「本轮数据 hh:mm:ss」——重新分析有没有真的跑过，只看这一位就够了。
+   台账没改的时候这一轮数字和上一轮完全一样，没有这个时间锚点就会看成"按了没反应"。 */
+.ai-round{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;
+  font-variant-numeric:tabular-nums}
+.ai-round i{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block}
+.ai-round i.off{background:var(--orange)}
+.ai-round i.spin{width:11px;height:11px;border:2px solid #bcd7f2;border-top-color:var(--blue-500);
+  background:none;animation:ai-spin .7s linear infinite}
+@keyframes ai-spin{to{transform:rotate(360deg)}}
+/* 重算这一轮时整块轻微压暗，配合转圈说明"在算"而不是"页面卡住" */
+.ai-panel.busy{opacity:.7}
+/* 重算完按钮留 4 秒「已更新 hh:mm:ss」，让没有数值变化的一次重算也能被确认 */
+.btn.done{background:#e7f6ed;color:#1c7a45;border-color:#a5dcbb}
 .ai-headline{font-size:14px;font-weight:600;color:#12406e;margin:0 0 10px}
 .ai-nums{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .ai-num{background:#fff;border:1px solid var(--ai-line);border-radius:10px;padding:7px 12px;
@@ -212,7 +230,7 @@ tr:hover td{background:#f9fcff}
 /* 抽屉（AI 解读 / 校准 / 表单）打开时收起悬浮球，避免压在抽屉上 */
 body.drawer-open .fab{opacity:0;pointer-events:none;transform:translateY(14px) scale(.86)}
 body.drawer-open .qa{right:20px}
-.qa{position:fixed;right:20px;bottom:86px;z-index:60;width:min(392px,calc(100vw - 24px));
+.qa{position:fixed;right:20px;bottom:86px;z-index:60;width:min(392px,calc(100% - 24px));
   height:min(560px,70vh);display:none;flex-direction:column;background:#fff;border-radius:14px;
   border:1px solid var(--ai-line);box-shadow:0 18px 46px rgba(8,32,60,.24);overflow:hidden}
 .qa.on{display:flex}
@@ -256,8 +274,8 @@ footer{text-align:center;color:#7d93aa;font-size:12px;padding:10px 0 26px}
   .hero-badges{right:2%;bottom:3%}
   .badge{font-size:11px;padding:3px 9px}
   .grid{grid-template-columns:1fr}
-  .drawer{width:100vw}
-  .qa{right:0;left:0;bottom:0;width:100vw;height:min(78vh,620px);border-radius:14px 14px 0 0}
+  .drawer{width:100%}
+  .qa{right:0;left:0;bottom:0;width:auto;height:min(78vh,620px);border-radius:14px 14px 0 0}
   .fab{right:14px;bottom:14px;width:48px;height:48px;font-size:20px}
   .qa.on ~ .fab{bottom:calc(14px + env(safe-area-inset-bottom,0px))}
   .sec-hd{align-items:flex-start}

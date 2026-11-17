@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="light" />
 <title>设备台账 · 煤矿排水设备故障风险预警平台</title>
+<link rel="icon" href="/logo.png" type="image/png" />
 <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
@@ -25,12 +26,14 @@
       <div class="sec-title">设备信息维护</div>
       <div class="sec-acts">
         <button class="btn ghost small" onclick="load()">刷新</button>
+        <button class="btn ghost small" type="button" onclick="openImport()">导入数据</button>
         <button class="btn small" onclick="openForm()">＋ 新增设备</button>
         <a class="btn ghost small" href="/risk">看智能分析 →</a>
       </div>
     </div>
-    <div class="tip">这一页管录入和查找：新增或修改后，下一次仿真（每 15 秒一轮）即按新参数计算；
-      额定电压 / 电流必须大于 0，否则该设备会被仿真跳过、没有实测数据。
+    <div class="tip">这一页管录入和查找：改完本页立刻重算，另外两个页签同步跟上（后台页签另有 15 秒兜底轮询）。
+      额定电压 / 电流必须大于 0，填 0 会带着 0 去算风险，分级就不可信了。
+      实测列取的是历史运行记录里最新一条，新录的设备没有记录时先显示「无数据」。
       「解读」看单台为什么高、怎么降，「校准」改潮湿粉尘这些现场填报项。
       设备多了按每页条数翻页，搜索和分级筛选会一起算页数。</div>
 
@@ -92,7 +95,8 @@
         <button class="btn ghost small" onclick="saveDefaultEnv()">保存默认温度</button>
       </div>
     </div>
-    <div class="tip">巷道基准温度影响「环境严酷度」这一项，改完下一次仿真生效。
+    <div class="tip">这里的基准温度只用于「智能分析」里环境严酷度的判断和说法，
+      看板分级用的环境温度取自历史运行记录，改这个值不会让分级跟着变。
       只想临时调某台设备的工况，用台账行里的「校准」（那部分写进数据库，不动这个配置）。</div>
     <div class="row2">
       <div>

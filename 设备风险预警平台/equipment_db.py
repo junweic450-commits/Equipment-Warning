@@ -99,10 +99,31 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+_TABLE_COLUMNS = None
+
+
+def _table_columns():
+    """equipment 表里真实存在的列名（取自表结构，不另抄一份，改了 schema 也不会漂开）。"""
+    global _TABLE_COLUMNS
+    if _TABLE_COLUMNS is None:
+        with _conn() as c:
+            _TABLE_COLUMNS = frozenset(r[1] for r in c.execute("PRAGMA table_info(equipment)"))
+    return _TABLE_COLUMNS
+
+
 def _clean(data):
-    """空字符串统一转 None，数字字段转 float。"""
+    """空字符串统一转 None，数字字段转 float。
+
+    键名一律对着表结构核一遍：add_device / update_device 是把键名拼进 SQL 的
+    （f"INSERT INTO equipment({cols})"），值虽然都走了参数绑定，键名却没有第二道闸。
+    现在传进来的键都是代码里写死的，但这道题不该靠每个调用方记住，数据层自己拒掉。
+    """
+    allowed = _table_columns()
     out = {}
     for k, v in data.items():
+        if k not in allowed:
+            raise ValueError("台账里没有「%s」这一列，可用的是：%s"
+                             % (k, "、".join(sorted(allowed))))
         if isinstance(v, str):
             v = v.strip()
             if v == "":
@@ -270,6 +291,16 @@ def delete_work_record(record_id):
 def get_work_records(limit=300):
     """获取最近工作维护记录。"""
     return search_work_records(limit=limit)
+def _csv_safe(value):
+    """Excel/WPS 会把以 = + - @ 开头的单元格当公式执行（CWE-1236），导出前加一个前导
+       单引号按纯文本存。只对文本生效：数字原样写，否则 -6.0 会变成文本，Excel 里
+       没法参与计算。看板那边的同一条规则在 dashboard._csv_cell，两处都要有。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
 
 
 def export_csv(path=None):
@@ -286,13 +317,10 @@ def export_csv(path=None):
         w = csv.writer(f)
         w.writerow(_CSV_HEADER)
         for r in rows:
-            w.writerow([
-                r["code"], r["name"], r["type"], r["location"] or "",
-                r["rated_v"] if r["rated_v"] is not None else "",
-                r["rated_i"] if r["rated_i"] is not None else "",
-                r["rated_p"] if r["rated_p"] is not None else "",
-                r["maker"] or "", r["commission_date"] or "",
-                r["status"], r["remark"] or "",
-                r["created_at"] or "", r["updated_at"] or "",
-            ])
+            w.writerow([_csv_safe(v) for v in (
+                r["code"], r["name"], r["type"], r["location"],
+                r["rated_v"], r["rated_i"], r["rated_p"],
+                r["maker"], r["commission_date"],
+                r["status"], r["remark"], r["created_at"], r["updated_at"],
+            )])
     return path

@@ -16,6 +16,8 @@ const AI = {
   global: null,
   agent: {ready: false, model: "", reason: ""},
   loading: false,
+  error: "",
+  flash: "",
   filter: "全部",
 };
 
@@ -51,14 +53,27 @@ function levelColor(key){
 /* 状态灯在渲染时就写好内容，不依赖渲染后再补一轮 refreshStatus——
    这样即使某次刷新时机错位，面板上也不会出现空白状态位。 */
 function panelShell(inner){
-  return `<div class="ai-panel">
+  return `<div class="ai-panel${AI.loading ? " busy" : ""}">
     <div class="ai-hd">
       <span class="ai-tag">✦ 智能分析</span>
       <span class="hint" style="margin:0">现场看板同一套数字算出来的，不是估的</span>
+      <span class="ai-round" data-ai-round>${roundHTML()}</span>
       <span class="ai-status" data-ai-status>${statusHTML()}</span>
     </div>
     ${inner}
   </div>`;
+}
+
+/* 「这一轮」必须有个可比对的锚点。重新分析跑完，如果页面上没有任何一个数字变，
+   点的人就没法区分"算过了、这轮确实一样"和"按钮根本没生效"，所以把分析时间摆出来：
+   它是服务端这一轮 _state() 的时间，每点一次必然变。 */
+function roundHTML(){
+  if (AI.loading) return `<i class="spin"></i>正在重新分析…`;
+  if (AI.error) return `<i class="off"></i>本轮失败：${aiEsc(AI.error)}`;
+  const ts = AI.global && AI.global.ts;
+  if (!ts) return "";
+  const clock = String(ts).slice(11) || String(ts);
+  return `本轮数据 ${aiEsc(clock)}`;
 }
 
 function shortReason(msg){
@@ -96,6 +111,28 @@ function refreshStatus(){
   if (btn) btn.disabled = !AI.agent.ready;
 }
 
+/* ---------------------------------------------------------------- 重新分析按钮 */
+/* 按钮在 [data-ai] 之外，面板重绘不会碰它，所以它的高亮/文案由这里单独维护；
+   面板里的「本轮数据 hh:mm:ss」负责证明这一轮确实重新算过。 */
+let refreshBtn = null;
+let flashTimer = null;
+
+function paintRefreshBtn(){
+  const el = refreshBtn || App.byId("btnReanalyze");
+  if (!el) return;
+  el.disabled = AI.loading;
+  el.textContent = AI.loading ? "分析中…" : (AI.flash || "重新分析");
+  el.classList.toggle("done", !AI.loading && !!AI.flash);
+}
+
+function flashDone(){
+  const ts = AI.global && AI.global.ts;
+  AI.flash = ts ? "已更新 " + String(ts).slice(11) : "已更新";
+  paintRefreshBtn();
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => { AI.flash = ""; paintRefreshBtn(); }, 4000);
+}
+
 /* ---------------------------------------------------------------- 数字条 */
 function numsHTML(g){
   const c = g.counts || {};
@@ -119,13 +156,26 @@ function actionItem(a){
   </li>`;
 }
 
+/* 列表里的排期：落在哪个窗口 + 哪天到期。正常级不进排期，留空比写「无」干净 */
+function planCell(p){
+  if (!p || !p.window) return "—";
+  const due = p.dates ? `${aiEsc(p.dates)}${p.overdue ? "（已到期）" : ""}` : "";
+  return `<span class="kind">${aiEsc(p.window)}</span>${due ? ` ${due}` : ""}`;
+}
+
 /* ---------------------------------------------------------------- 完整态 */
 function fullHTML(g){
-  const rows = (g.briefs || []).map(d => `<tr id="dev-${aiEsc(d.code)}">
+  /* 「一台一台看」的设备会一直往台账里加，一次全铺完没法看，所以复用首页/台账那套
+     分页控件（每页条数、上一页下一页、页码窗口都是同一份代码，翻页由 common.js
+     的 bindPager 接住，再通过 onRender 回调重画这一块）。 */
+  const briefs = g.briefs || [];
+  const pg = App.paginate(briefs, "ai");
+  const rows = pg.rows.map(d => `<tr id="dev-${aiEsc(d.code)}">
       <td>${aiEsc(d.code)}</td><td>${aiEsc(d.name)}</td><td>${aiEsc(d.location || "-")}</td>
       <td style="color:${levelColor({正常: "green", 关注: "yellow", 预警: "orange", 报警: "red"}[d.level] || "gray")};font-weight:700">${aiEsc(d.level)}</td>
       <td>${pct(d.risk, 2)}</td><td>${pct(d.cond_risk, 2)}</td>
       <td>${aiEsc(d.main_cause)}</td>
+      <td>${planCell(d.plan)}</td>
       <td><button class="btn ai small" data-act="ai" data-code="${aiEsc(d.code)}">解读</button></td>
     </tr>`).join("");
 
@@ -176,14 +226,16 @@ function fullHTML(g){
         `<li class="ai-item"><div class="d">当前没有需要处理的事项。</div></li>`}</ul>
     </div>
     <div class="ai-block" style="margin-top:14px">
-      <h5>一台一台看</h5>
+      <h5>一台一台看 <span class="hint" style="display:inline;margin:0">（${briefs.length} 台）</span></h5>
       <p class="hint">「风险」是综合值；「现场」是潮湿、粉尘、检修这些填报项算出来的那部分。
-        点「解读」看这台为什么高、怎么降。</p>
+        「排期」按每台的计划检修频率倒推出到期日，和上面检修排期表同一口径。
+        点「解读」看这台为什么高、怎么降；要交班留痕，用右上角「导出…」存成 CSV，数字和这一页同一套。</p>
       <div class="table-scroll" id="aiDeviceList"><table>
         <tr><th>编号</th><th>名称</th><th>巷道</th><th>分级</th><th>风险</th>
-            <th>现场</th><th>主要问题</th><th>操作</th></tr>
-        ${rows || `<tr><td colspan="8">暂无设备</td></tr>`}
+            <th>现场</th><th>主要问题</th><th>排期</th><th>操作</th></tr>
+        ${rows || `<tr><td colspan="9">暂无设备</td></tr>`}
       </table></div>
+      ${pg.size ? App.pagerHTML("ai", pg.page, pg.pages, briefs.length, pg.size) : ""}
     </div>
     <div class="ai-more">
       <button class="btn ai small" id="aiAdvBtn" data-ai-adv="global">让 AI 补充建议</button>
@@ -254,7 +306,13 @@ function setAgentOut(box, html){
 function renderPanels(){
   const g = AI.global;
   document.querySelectorAll("[data-ai]").forEach(box => {
-    if (!g){ box.innerHTML = `<div class="ai-panel"><div class="ai-skel">正在分析风险结果…</div></div>`; return; }
+    if (!g){
+      box.innerHTML = AI.loading
+        ? panelShell(`<div class="ai-skel">正在分析风险结果…</div>`)
+        : panelShell(`<div class="ai-err">分析失败：${aiEsc(AI.error || "接口没有返回内容")}
+            <br>台账和看板数字不受影响，点右上角「重新分析」可再算一轮。</div>`);
+      return;
+    }
     box.innerHTML = fullHTML(g);
     const kept = AGENT_OUT.get(box);
     if (kept){
@@ -265,22 +323,38 @@ function renderPanels(){
   refreshStatus();
 }
 
-async function loadGlobal(){
-  if (AI.loading) return;
+/* 面板重绘出任何问题都不能把 AI.loading 留在 true：一旦卡住，
+   下面的入口守卫会让之后每一次点击、以及每 15 秒的自动刷新都静默返回，
+   表现就是「重新分析」按了彻底没反应，只能刷新整页才能救回来。 */
+function repaint(){
+  try{ renderPanels(); }
+  catch(e){
+    console.error("智能分析面板渲染失败", e);
+    AI.error = "这一轮结果没能画出来（数据格式异常），已保留上一轮内容";
+  }
+  try{ paintRefreshBtn(); }catch(e){ console.error(e); }
+}
+
+async function loadGlobal(btn){
+  if (btn) refreshBtn = btn;
+  const manual = !!btn;
+  if (AI.loading) return AI.global;
   AI.loading = true;
-  renderPanels();
+  AI.flash = "";
+  repaint();                          // 点下去立刻进「分析中」，不用等接口回来
   try{
     const res = await App.api("/api/analysis");
     AI.global = res.result;
+    AI.error = "";
   }catch(e){
     AI.global = null;
-    document.querySelectorAll("[data-ai]").forEach(box => {
-      box.innerHTML = panelShell(`<div class="ai-err">分析失败：${aiEsc(e.message)}</div>`);
-    });
+    AI.error = e.message || "分析失败";
   }finally{
     AI.loading = false;
-    renderPanels();
+    repaint();
+    if (manual && !AI.error) flashDone();
   }
+  return AI.global;
 }
 
 async function loadAgentStatus(){
@@ -334,7 +408,7 @@ function bindPanelEvents(){
       return;
     }
     const flt = e.target.closest("[data-ai-filter]");
-    if (flt){ AI.filter = flt.dataset.aiFilter; renderPanels(); return; }
+    if (flt){ AI.filter = flt.dataset.aiFilter; repaint(); return; }
     const ask = e.target.closest("[data-ai-ask]");
     if (ask){ App.closeAll(); QA.openWithDevice(ask.dataset.aiAsk); return; }
     const openqa = e.target.closest("[data-ai-open]");
@@ -349,6 +423,9 @@ window.SmartAnalysis = {
   mountAll(){
     bindPanelEvents();
     if (!document.querySelectorAll("[data-ai]").length) return;
+    /* 分页控件的点击由 common.js 的 bindPager 统一接住、统一调 render()，
+       这里挂个渲染回调，让整页重绘时把「一台一台看」的新一页画出来。 */
+    App.onRender(() => { renderPanels(); });
     loadAgentStatus();
     loadGlobal();
     App.onState(() => { loadGlobal(); });

@@ -25,6 +25,15 @@ from datetime import datetime, timedelta
 # 45 只在遥测或填报缺失时兜底，保证这一档永远有日期可显示。
 PLAN_DAYS = {"这几天": 3, "两周内": 14, "下次检修": 45}
 
+# 分级 → 排期窗口。全局分档、单台解读的「什么时候处理」、CSV 导出共用这三张表，
+# 免得同一个口径写在三处，改一处漏一处。「正常」级不进排期。
+LEVEL_WINDOW = {"red": "这几天", "orange": "两周内", "yellow": "下次检修", "gray": "先补数据"}
+WINDOW_TAIL = {"这几天": "建议本周内停机检查。", "两周内": "建议两周内安排检修。",
+               "下次检修": "不紧急，下次检修一起处理。", "先补数据": "先补数据再判断。"}
+WINDOW_REASON = {"这几天": "报警级，随时可能出故障", "两周内": "预警级，赶下个检修窗口前处理掉",
+                 "下次检修": "关注级，跟计划检修一起办",
+                 "先补数据": "没有运行数据，算不出风险，先把数据接上"}
+
 # 分级阈值：来自排水设备现场经验口径，集中放这里便于和工艺人员一起校订
 TH = {
     "load_ratio_high": 1.10,     # 电流 / 额定电流
@@ -91,6 +100,31 @@ def _next_repair_date(device, base):
         return None
     last = base - timedelta(days=since / 24.0)
     return last + timedelta(days=90.0 / per_quarter)
+
+
+def _plan_for(device, level_key, base):
+    """单台的排期结论：落在哪个窗口、哪天到期、给用户看的那句话。
+
+    「下次检修」这一档不写死 45 天，用台账里的计划检修频率倒推每台自己的到期日，
+    和 analyze_global 的排期表同一口径；缺遥测或没填频率时退回通用文案，不编日期。
+    """
+    window = LEVEL_WINDOW.get(level_key)
+    if not window:
+        return {"window": "", "due": "", "dates": "", "overdue": 0,
+                "tail": "按正常巡检走就行。"}
+    out = {"window": window, "due": "", "dates": "", "overdue": 0,
+           "tail": WINDOW_TAIL[window]}
+    if window == "下次检修":
+        due = _next_repair_date(device, base)
+        if due:
+            out["due"] = due.isoformat()
+            # dates 是给人看的期限：和排期表一样不把"昨天"写在期限位上，逾期由 overdue 说明
+            out["dates"] = _cn_date(max(due, base))
+            out["overdue"] = 1 if due < base else 0
+            out["tail"] = ("不紧急，但按台账倒推检修期已经过了（原计划 %s），这轮一起补上。" % _cn_date(due)
+                           if out["overdue"] else
+                           "不紧急，下次检修一起处理（预计 %s 到期）。" % _cn_date(due))
+    return out
 
 
 def _fmt_val(value):
@@ -359,7 +393,7 @@ def _actions(device, signals, whatif):
 
     if device.get("telemetry") is None:
         acts.append({"priority": base, "kind": "数据接入", "title": "给这台设备补运行数据",
-                     "detail": "台账里有这台，但仿真数据里没有它的运行记录",
+                     "detail": "台账里有这台，但历史运行记录里没有它的实测数据",
                      "expect": "有了数据才算得出设备本身的风险，现在只按现场情况评级"})
     if device.get("error"):
         acts.append({"priority": "高", "kind": "异常", "title": "这条预测失败了，要人工看一眼",
@@ -377,8 +411,11 @@ def _actions(device, signals, whatif):
 # --------------------------------------------------------------------------
 # 单台：主入口
 # --------------------------------------------------------------------------
-def analyze_device(device, hooks=None):
-    """输入 _predict_all() 里的一条设备字典，输出结构化解读。"""
+def analyze_device(device, hooks=None, state=None):
+    """输入 _predict_all() 里的一条设备字典，输出结构化解读。
+
+    state 可省略：只有「什么时候该检修」那句需要基准日，拿不到看板 ts 时退回本机今天。
+    """
     hooks = hooks or {}
     raw = _num(device.get("raw_risk"))
     cond = _num(device.get("cond_risk"))
@@ -407,10 +444,8 @@ def analyze_device(device, hooks=None):
                    key=lambda it: -float(it.get("contribution") or 0))
     top_items = [it for it in items if float(it.get("contribution") or 0) > 0.005][:2]
 
-    tail = {"red": "建议本周内停机检查。", "orange": "建议两周内安排检修。",
-            "yellow": "不紧急，下次检修一起处理。",
-            "green": "按正常巡检走就行。", "gray": "先补数据再判断。"}.get(
-                level.get("key", "gray"), "")
+    plan = _plan_for(device, level.get("key", "gray"), _as_of(state))
+    tail = plan["tail"]
 
     if risk is None:
         headline = "%s：没有风险数据。%s" % (name, "先补运行数据，或看预测是不是报错了。")
@@ -455,6 +490,7 @@ def analyze_device(device, hooks=None):
         "split": {"model": round(model_part, 4) if model_part is not None else None,
                   "condition": round(cond_part, 4), "overlap": round(overlap, 4)},
         "signals": signals, "whatif": whatif, "actions": actions,
+        "plan": plan,
         "source": device.get("source") or "—",
         "caveats": [c for c in (
             "没有运行数据，设备本身那一路算不出来，现在只按现场情况评级" if device.get("telemetry") is None else
@@ -584,30 +620,22 @@ def analyze_global(state, hooks=None):
         level = _verdict(value, TH["env_temp_high"], TH["env_temp_mid"])
         if level:
             env_issues.append({"tunnel": tunnel, "temp": value, "level": level,
-                               "note": "巷道「%s」基准温度 %.1f℃，这条巷道里设备的温度都被往上带"
+                               "note": "巷道「%s」基准温度 %.1f℃，配置里这条巷道的设备都按这个温度参考"
                                        % (tunnel, value)})
     default_env = _num(env.get("default_env_base"))
     if default_env is not None and default_env >= TH["env_temp_high"]:
         env_issues.append({"tunnel": "默认基准", "temp": default_env, "level": "高",
                            "note": "没匹配到巷道的设备都用这个温度，先核对填得对不对"})
 
-    # 检修排期分档
+    # 检修排期分档（窗口口径与单台解读共用 LEVEL_WINDOW）
     buckets = {"这几天": [], "两周内": [], "下次检修": [], "先补数据": []}
     for d in devices:
-        key = (d.get("level") or {}).get("key")
-        if key == "gray":
-            buckets["先补数据"].append(d.get("code"))
-        elif key == "red":
-            buckets["这几天"].append(d.get("code"))
-        elif key == "orange":
-            buckets["两周内"].append(d.get("code"))
-        elif key == "yellow":
-            buckets["下次检修"].append(d.get("code"))
+        window = LEVEL_WINDOW.get((d.get("level") or {}).get("key"))
+        if window:
+            buckets[window].append(d.get("code"))
 
     plan = []
-    window_reason = {"这几天": "报警级，随时可能出故障", "两周内": "预警级，赶下个检修窗口前处理掉",
-                     "下次检修": "关注级，跟计划检修一起办",
-                     "先补数据": "没有运行数据，算不出风险，先把数据接上"}
+    window_reason = WINDOW_REASON
     base = _as_of(state)
     by_code = {d.get("code"): d for d in devices}
     for window, codes in buckets.items():
@@ -661,7 +689,7 @@ def analyze_global(state, hooks=None):
     for e in env_issues[:3]:
         actions.append({"priority": e["level"], "kind": "核对温度",
                         "title": "核对「%s」的基准温度" % e["tunnel"],
-                        "detail": e["note"], "expect": "改 sim_config.json，下次仿真就生效"})
+                        "detail": e["note"], "expect": "改 sim_config.json 只校正这段分析口径，看板分级仍按实测记录"})
     if no_data:
         actions.append({"priority": "中", "kind": "补数据", "title": "给 %d 台补运行数据" % no_data,
                         "detail": "这些设备现在只按现场情况评级，设备本身那一路是空的",
@@ -687,12 +715,12 @@ def analyze_global(state, hooks=None):
         if no_data:
             headline += "另有 %d 台没有运行数据。" % no_data
 
-    briefs = [device_brief(d) for d in devices]
+    briefs = [device_brief(d, base) for d in devices]
     return {
         "scope": "global", "headline": headline, "total": total,
         "counts": counts, "mean_risk": round(mean, 4), "danger": danger,
         "no_data": no_data, "model_ready": state.get("model_ready"),
-        "top": [device_brief(d) for d in scored[:5]],
+        "top": [device_brief(d, base) for d in scored[:5]],
         "briefs": briefs,
         "patterns": patterns, "common_factors": common_factors,
         "env_issues": env_issues, "plan": plan, "actions": actions,
@@ -700,8 +728,8 @@ def analyze_global(state, hooks=None):
     }
 
 
-def device_brief(device):
-    """给前端列表和大模型上下文用的紧凑摘要。"""
+def device_brief(device, base=None):
+    """给前端列表、CSV 导出和大模型上下文用的紧凑摘要。"""
     tel = device.get("telemetry") or {}
     return {
         "code": device.get("code"), "name": device.get("name"),
@@ -709,6 +737,8 @@ def device_brief(device):
         "risk": _num(device.get("risk")), "raw_risk": _num(device.get("raw_risk")),
         "cond_risk": _num(device.get("cond_risk")),
         "level": (device.get("level") or {}).get("name", "无数据"),
+        "plan": _plan_for(device, (device.get("level") or {}).get("key"),
+                          base or _as_of(None)),
         "main_cause": _main_cause(device),
         "dev_temp": _num(tel.get("dev_temp")), "env_temp": _num(tel.get("env_temp")),
         "current": _num(tel.get("current")), "rated_i": _num(device.get("rated_i")),
@@ -744,6 +774,12 @@ def context_blob(analysis, limit=24):
             lines.append("- 超标：%s %s%s（%s）— %s" % (s["label"], s["value"], s["unit"], s["level"], s["note"]))
         for a in (d.get("actions") or [])[:6]:
             lines.append("- 该做的事[%s]：%s；%s" % (a["priority"], a["title"], a.get("expect") or ""))
+        plan = d.get("plan") or {}
+        if plan.get("window"):
+            lines.append("- 什么时候处理：%s%s%s" % (
+                plan["window"],
+                "，期限 %s" % plan["dates"] if plan.get("dates") else "",
+                "，已到期" if plan.get("overdue") else ""))
         return "\n".join(lines)
 
     c = analysis["counts"]

@@ -8,11 +8,14 @@
     5. 智能分析：本地规则引擎解读风险结果并给出可行方案（/api/analysis，
        主页面总览区与 /risk 详情页共用同一实现）
     6. 云知声 Agent 问答：服务端代理，密钥不出本机（/api/agent/*，SSE 流式）
+    7. 报表导出：设备风险清单 / 治理措施 / 检修排期一键导出 CSV（/api/export），
+       数字取自与看板同一次分析结果，可直接拿去交班和归档
 
 页面（每页只干一件事，同一块内容不在两页重复出现）：
     /          风险概览：统计条 + 设备卡片（按风险从高到低，每页 12 台可翻页，
                每台卡片上是单台「AI 解读」入口）
-    /risk      智能分析：共性归因 / 治理方案 / 检修排期 / 一台一台看 / AI 补充建议
+    /risk      智能分析：共性归因 / 治理方案 / 检修排期 / 一台一台看（可翻页）/
+               一键导出 CSV / AI 补充建议
     /devices   设备台账：完整表格（可搜索、按分级筛、每页 24 行可翻页）+ 增删改 + 巷道基准温度
     /model-center 模型训练中心：运行样本反馈、审核、HGBT 重训练与版本记录
 
@@ -35,6 +38,9 @@
 """
 
 import argparse
+import base64
+import csv
+import io
 import ipaddress
 import json
 import math
@@ -51,7 +57,7 @@ import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
 
@@ -280,6 +286,50 @@ def _host_ok(host_header):
         return True
     except ValueError:
         return host in _allowed_host_names()
+
+
+DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def _origin_key(value):
+    """URL / Origin / Host → (host, port)，默认端口归一化；认不出来返回 None。"""
+    text = (value or "").strip().lower()
+    if "://" in text:
+        scheme, text = text.split("://", 1)
+        if scheme not in DEFAULT_PORTS:
+            return None
+        default = DEFAULT_PORTS[scheme]
+    else:
+        default, text = "http", text                 # Host 头没有协议，按本平台实际部署当 http
+    text = text.split("/", 1)[0].split("?", 1)[0]
+    if text.startswith("["):                         # IPv6 字面量 [::1]:8770
+        host, _, tail = text[1:].partition("]")
+        port = tail.partition(":")[2]
+    elif text.count(":") == 1:
+        host, port = text.split(":", 1)
+    else:
+        host, port = text, ""
+    if not host:
+        return None
+    return host, (port or default)
+
+
+def _origin_ok(origin, host_header):
+    """写请求的来源校验（防跨站伪造）。
+
+    本平台按约定绑 0.0.0.0 且不登录，局域网里任何一台机器都能直接打到这些写接口；
+    同事开着看板的浏览器一旦访问了恶意网页，脚本就能用
+        fetch("http://192.168.x.x:8770/api/device/delete",
+              {method: "POST", body: '{"code":"PS-001"}',
+               headers: {"Content-Type": "text/plain"}})
+    把台账删掉 —— text/plain 属于「简单请求」，浏览器不会先发预检，挡不住。
+    能挡住的只有 Origin：浏览器发任何非 GET 请求都必定带上它，所以口径是
+    「带了就必须与 Host 同源；没带的是 curl / 命令行 / 测试脚本，放行」。
+    """
+    if not origin:
+        return True
+    want, got = _origin_key(host_header), _origin_key(origin)
+    return want is not None and want == got
 
 
 
@@ -547,11 +597,56 @@ def _analysis(code=None):
         return ai_analyze.analyze_global(state, ANALYSIS_HOOKS)
     for device in state["devices"]:
         if device["code"] == code:
-            result = ai_analyze.analyze_device(device, ANALYSIS_HOOKS)
+            result = ai_analyze.analyze_device(device, ANALYSIS_HOOKS, state=state)
             result["scope"] = "device"
             result["env"] = state.get("env", {})
             return result
     return None
+
+
+# --------------------------------------------------------------------------
+# 报表导出（/api/export）：CSV 数字直接取 analyze_global 的同一份结果，
+# 导出的和看板上看到的必然一致，不用人再抄一遍。
+# --------------------------------------------------------------------------
+EXPORT_KINDS = {"devices": "设备风险清单", "actions": "治理措施清单", "plan": "检修排期表"}
+
+
+def _csv_pct(value):
+    return "" if value is None else "%.2f%%" % (float(value) * 100)
+
+
+def _csv_cell(value):
+    """Excel/WPS 会把以 = + - @ 开头的单元格当公式执行。台账里的名称、备注是人工填的，
+       导出前给这几个开头的字段加一个前导单引号，按纯文本存，公式打不开。"""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
+def _export_rows(kind, g):
+    ts = g.get("ts") or "—"
+    if kind == "devices":
+        head = ["设备编号", "名称", "型号", "巷道", "分级", "综合风险", "设备本身",
+                "现场情况", "处理窗口", "检修到期", "主要问题", "分析时间"]
+        body = [[b["code"], b["name"], b["type"], b["location"], b["level"],
+                 _csv_pct(b["risk"]), _csv_pct(b["raw_risk"]), _csv_pct(b["cond_risk"]),
+                 (b.get("plan") or {}).get("window", ""),
+                 (b.get("plan") or {}).get("dates", ""), b["main_cause"], ts]
+                for b in g["briefs"]]
+    elif kind == "actions":
+        head = ["优先级", "类别", "事项", "现状", "预期效果", "分析时间"]
+        body = [[a["priority"], a["kind"], a["title"], a["detail"], a["expect"], ts]
+                for a in g["actions"]]
+    else:
+        head = ["处理窗口", "台数", "设备编号", "依据", "期限", "其中已到期", "分析时间"]
+        body = [[p["window"], p["count"], "、".join(p["codes"]), p["reason"],
+                 p["dates"], p["overdue"], ts] for p in g["plan"]]
+    return [head] + [[_csv_cell(cell) for cell in row] for row in body]
+
+
+def _export_filenames(kind, ts):
+    """一份 ASCII 兜底名 + 一份 UTF-8 中文名，老浏览器和新浏览器都能存对。"""
+    digits = re.sub(r"\D", "", ts or "") or datetime.now().strftime("%Y%m%d%H%M%S")
+    return "risk_%s_%s.csv" % (kind, digits), "%s_%s.csv" % (EXPORT_KINDS[kind], digits)
 
 
 def _agent_context(payload):
@@ -749,8 +844,13 @@ def _delete_work_record(payload):
 # --------------------------------------------------------------------------
 # 写入接口
 # --------------------------------------------------------------------------
-def _save_device(payload):
-    """新增或修改台账（编号已存在即覆盖）。"""
+def _device_form(payload):
+    """台账校验与归一，单台保存和批量导入共用同一套规则。
+
+    导入绝不能有自己的一套校验，否则 CSV 里可以填进表单挡得住的东西（比如
+    额定电流 0、投运日期 2024-13-45、类型不在下拉选项里），进去之后看板就会
+    按脏数据算风险。返回可直接写库的 dict。
+    """
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
     code = _clean_text(payload.get("code"), "code")
@@ -781,9 +881,7 @@ def _save_device(payload):
             raise ValueError("%s不能超过 %g" % (label, maximum))
         return value
 
-    date_text = _check_date(payload.get("commission_date"))
-
-    data = {
+    return {
         "code": code,
         "name": name,
         "type": payload["type"],
@@ -792,23 +890,370 @@ def _save_device(payload):
         "rated_i": _number("rated_i", "额定电流", 100000),
         "rated_p": _number("rated_p", "额定功率", 100000),
         "maker": _clean_text(payload.get("maker"), "maker"),
-        "commission_date": date_text,
+        "commission_date": _check_date(payload.get("commission_date")),
         "status": status,
         "remark": _clean_text(payload.get("remark"), "remark"),
     }
-    with _STORE_LOCK:                      # 查重与写入必须同锁，否则并发同名会撞主键
+
+
+def _write_device(data):
+    """按编号存在与否决定新增还是覆盖；查重与写入必须同锁。"""
+    with _STORE_LOCK:
         try:
-            existing = equipment_db.get_one_device(code)
+            existing = equipment_db.get_one_device(data["code"])
             if existing:
-                equipment_db.update_device(code, data)
+                equipment_db.update_device(data["code"], data)
                 action = "update"
             else:
                 equipment_db.add_device(data)
                 action = "add"
         except sqlite3.IntegrityError:
             raise ValueError("设备编号已存在")
-    _audit("DEVICE %s code=%s name=%s" % (action.upper(), code, name))
-    return {"ok": True, "action": action, "code": code}
+    return action
+
+
+def _save_device(payload):
+    """新增或修改台账（编号已存在即覆盖）。"""
+    data = _device_form(payload)
+    action = _write_device(data)
+    _audit("DEVICE %s code=%s name=%s" % (action.upper(), data["code"], data["name"]))
+    return {"ok": True, "action": action, "code": data["code"]}
+
+
+# --------------------------------------------------------------------------
+# 台账批量导入（CSV / Excel）
+# --------------------------------------------------------------------------
+IMPORT_MAX_ROWS = 500
+IMPORT_ERROR_SHOWN = 40    # 失败明细最多回这些条，再多前端也铺不开，只报总数
+IMPORT_MAX_CELL = 400      # 单个单元格超过这个长度基本是整段说明挤进一列，别写进台账
+# .xlsx 解压后可以比文件本身大几百倍（实测 14 KB 的 zip 摊开 11 MB），所以格子总量
+# 也要有个数：500 行 × 200 列的预算，正常台账只有十几列，怎么都碰不到。
+IMPORT_MAX_XLSX_CELLS = 100_000
+
+
+def _row_cap_error(count):
+    """行数超上限的说法只留一处：CSV 与 Excel 报出来的必须一模一样。
+
+    Excel 那条路是边读边判，报出来的数是「读到第几行发现超了」而不是文件总行数，
+    20 万行的表会显示成 501，所以两边统一说「至少」，谁都不撒谎。
+    """
+    return ValueError("一次最多导 %d 行，这份至少 %d 行，请在 Excel 里拆成几份分次导"
+                      % (IMPORT_MAX_ROWS, count))
+
+# 模板 / 界面展示的表头（和「导出台账」用的是同一套字，导出去改完能原样导回来）
+IMPORT_HEADER = {
+    "code": "设备编号", "name": "设备名称", "type": "设备类型", "location": "安装位置",
+    "rated_v": "额定电压(kV)", "rated_i": "额定电流(A)", "rated_p": "额定功率(kW)",
+    "maker": "生产厂家", "commission_date": "投运日期", "status": "运行状态", "remark": "备注",
+}
+# 各矿自己攒的表头写法不一，靠这张表认；键一律是 _norm_header 归一之后的形式。
+IMPORT_ALIASES = {
+    "设备编号": "code", "编号": "code", "设备号": "code", "资产编号": "code",
+    "设备名称": "name", "名称": "name", "设备名": "name", "资产名称": "name",
+    "设备类型": "type", "类型": "type", "设备类别": "type", "类别": "type",
+    "安装位置": "location", "位置": "location", "巷道": "location", "安装地点": "location",
+    "额定电压": "rated_v", "额定电压kv": "rated_v", "电压": "rated_v",
+    "额定电流": "rated_i", "额定电流a": "rated_i", "电流": "rated_i",
+    "额定功率": "rated_p", "额定功率kw": "rated_p", "功率": "rated_p",
+    "生产厂家": "maker", "厂家": "maker", "制造商": "maker", "生产商": "maker",
+    "投运日期": "commission_date", "投运时间": "commission_date",
+    "启用日期": "commission_date", "上线日期": "commission_date",
+    "运行状态": "status", "状态": "status",
+    "备注": "remark", "说明": "remark",
+    "code": "code", "name": "name", "type": "type", "location": "location",
+    "ratedv": "rated_v", "ratedi": "rated_i", "ratedp": "rated_p",
+    "maker": "maker", "commissiondate": "commission_date", "status": "status",
+    "remark": "remark",
+}
+
+
+def _norm_header(raw):
+    """表头归一：去 BOM、去括号里的单位、去掉所有空白和常见分隔符、转小写。
+
+    「额定电压(kV)」「额定电压 KV」「rated_V」必须落到同一个键上，否则现场任何一处
+    表头写法不同，整列数据就静默丢了。
+    """
+    s = str(raw or "").replace("\ufeff", "").strip().lower()
+    s = re.sub(r"[（(][^（）()]*[）)]", "", s)
+    s = re.sub(r"[\s_\-/·、,，.。:：]+", "", s)
+    return s
+
+
+_DATE_LOOSE = re.compile(r"^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?$")
+
+
+def _import_value(field, raw):
+    """按字段做最小限度的清洗，把 Excel 常见的写法收回成接口认的形式。"""
+    v = str(raw or "").strip()
+    if field == "commission_date":
+        v = re.split(r"[ T]", v, maxsplit=1)[0]        # 2024-05-06 00:00:00 → 2024-05-06
+        m = _DATE_LOOSE.match(v)              # 2024/5/6、2024年5月6日 → 2024-05-06
+        if m:
+            v = "%04d-%02d-%02d" % tuple(int(g) for g in m.groups())
+        return v
+    if field == "rated_p":
+        v = re.sub(r"(?i)\s*kw\s*$", "", v)   # 「400kW」也是常见写法
+    return v
+
+
+def _read_device_csv(text, force_delim=None):
+    """CSV 文本 → ([(表格行号, {字段名: 原文})], 分隔符, 表头里没认出的列).
+
+    分隔符按表头行里出现次数最多的候选定，不用 csv.Sniffer：Sniffer 只看首行，
+    表头里恰好只有一个逗号时会从正文挑分号当分隔符，整份解析结果跟着错位。
+    force_delim 是给 Excel 那条路用的（_read_device_xlsx 把单元格摊成 Tab 文本再
+    从这里进来），分隔符已经定死，嗅探和引号闭合这两道保险就不必再判一遍。
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()                    # 只去掉末尾换行产生的空串，中间空行留着按行号报
+    if not any(ln.strip() for ln in lines):
+        raise ValueError("文件里没有内容")
+    head_idx = next(i for i, ln in enumerate(lines) if ln.strip())
+    delim = force_delim
+    if delim is None:
+        head = lines[head_idx]
+        delim = max((",", ";", "\t", "|"), key=head.count)
+        if head.count(delim) == 0:
+            raise ValueError("没认出分隔符：第一行得是表头，各列用逗号 / 分号 / Tab 分开")
+        if not (head.count('"') % 2 == 0 and sum(ln.count('"') % 2 for ln in lines[head_idx:]) % 2 == 0):
+            raise ValueError("有单元格的双引号没闭合，后面的行会被并到一起，请在 Excel 里检查后再导")
+
+    rows = list(csv.reader(lines[head_idx:], delimiter=delim))
+    fields, unknown = {}, []
+    for i, cell in enumerate(rows[0]):
+        text = str(cell or "").strip()
+        key = IMPORT_ALIASES.get(_norm_header(cell))
+        if key is None:
+            if text and text not in unknown:
+                unknown.append(text)
+        elif key in fields.values():
+            if text and text not in unknown:      # 同名列重复出现，后一列不覆盖前一列
+                unknown.append(text + "（重复列）")
+        else:
+            fields[i] = key
+    missing = [IMPORT_HEADER[k] for k in ("code", "name", "type") if k not in fields.values()]
+    if missing:
+        raise ValueError("表头里缺 %s 这几列。点「下载模板」照格式填，或把这些列改成上面的名字。"
+                         % "、".join(missing))
+
+    records = []
+    for i, cells in enumerate(rows[1:], start=head_idx + 2):
+        rec = {}
+        for j, field in fields.items():
+            if j >= len(cells):
+                continue
+            v = _import_value(field, cells[j])
+            if len(v) > IMPORT_MAX_CELL:
+                raise ValueError("第 %d 行的「%s」有 %d 个字，多半是整段说明挤进了一列；"
+                                 "这种行请在 Excel 里分列后再导" % (i, IMPORT_HEADER[field], len(v)))
+            rec[field] = v
+        if any(rec.values()):                    # 空行、只有空格的行直接跳过不计数
+            records.append((i, rec))
+    return records, delim, unknown
+
+
+def _read_device_xlsx(data):
+    """Excel 2007+ 的 .xlsx 原文件 → 与 _read_device_csv 完全相同的三元组。
+
+    这里只把单元格摊成 Tab 分隔文本，表头别名、必填列、超长单元格、行号这套校验
+    全部走 _read_device_csv 那一份代码：同一张表存成 .xlsx 和存成 .csv 导进来必须
+    得到一模一样的预检结果，两套解析逻辑各自演化迟早漂开。
+    日期单元格 openpyxl 给的就是 datetime，str() 之后正好被 _import_value 按空格
+    截成 YYYY-MM-DD，不必自己按 1900/1904 纪元换算 Excel 的序列号。
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise ValueError("服务器上没有 openpyxl，导不了 .xlsx：执行 .venv/bin/pip install openpyxl，"
+                         "或在 Excel 里「另存为 CSV」再导")
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as exc:
+        # 坏 zip / 设了打开密码 / 97-2003 的 .xls，openpyxl 抛的类型不一，统一收成一句照着做就能过的话
+        raise ValueError("这个 Excel 文件打不开：%s。如果是 97-2003 的 .xls 或在 Excel 里设过打开密码，"
+                         "请另存为 .xlsx（去掉密码）或 CSV 再导" % exc)
+    try:
+        buf = io.StringIO()
+        writer = csv.writer(buf, delimiter="\t", lineterminator="\n")
+        sheet, sheets = wb.worksheets[0], len(wb.sheetnames)
+        # 一行一格、空行也写出去，文本的第 i 行就是 Excel 的第 i+1 行，
+        # 报错报出来的行号才和班组自己那份表对得上。
+        # 上限必须在读的过程中生效：read_only 是流式的，边读边判只看得到前几百行，
+        # 摊平之后才判等于先把几十 MB 内存吃掉、把线程占住几秒，再告诉人家「太多了」。
+        rows = cells = 0
+        header_done = False
+        for row in sheet.iter_rows(values_only=True):
+            cells += len(row)
+            if cells > IMPORT_MAX_XLSX_CELLS:
+                raise ValueError("这份 Excel 摊开有 %d 个格子，超过导入上限 %d 个（台账通常只有十几列）。"
+                                 "请确认导的是台账本身，不是带格式的大空表；"
+                                 "若表里确实有这么多列，请删掉无关列另存一份再导"
+                                 % (cells, IMPORT_MAX_XLSX_CELLS))
+            filled = any(v is not None and str(v) != "" for v in row)
+            if filled and not header_done:
+                header_done = True            # 第一处有内容的行是表头，不算数据行
+            elif filled:
+                rows += 1
+                if rows > IMPORT_MAX_ROWS:
+                    raise _row_cap_error(rows)
+            writer.writerow(["" if v is None else str(v) for v in row])
+        title = sheet.title
+    finally:
+        wb.close()                                 # read_only 的 workbook 底下是个没关的 zip
+    records, _, unknown = _read_device_csv(buf.getvalue(), "\t")
+    # 只读第一张是明说的规矩（多张表的口径一旦各读一张，台账就分不清哪份是准的），
+    # 但读的是哪张、这份一共几张得写在结果上：改了第三张表却导不进来的时候，
+    # 班组靠这句提示才知道要把它挪到第一张。
+    label = "Excel 工作表「%s」" % title
+    if sheets > 1:
+        label += "（这份共 %d 张表，只读第一张）" % sheets
+    return records, label, unknown
+
+
+def _write_import_batch(staged):
+    """逐条落库；某条被数据库挡下时停下并说明已写入几条，不假装整批都成功。"""
+    written, errors = [], []
+    for action, data, line_no in staged:
+        try:
+            written.append((_write_device(data), data["code"], line_no))
+        except (ValueError, sqlite3.Error) as exc:
+            done = len(written)
+            errors.append({"line": line_no, "code": data["code"] or "—",
+                           "reason": "%s（前面 %d 条已写入，本条及之后没写）" % (exc, done)})
+            break
+    return written, errors
+
+
+def _overview_counts():
+    """导完顺带把风险概览的数字算好，前端不用再发一次 /api/state。
+
+    复用 _predict_all()，和看板、智能分析完全同一套口径，避免导入自己另算一遍
+    得出另一组数字。
+    """
+    devices, model_ready = _predict_all()
+    counts = {"green": 0, "yellow": 0, "orange": 0, "red": 0, "gray": 0}
+    for d in devices:
+        key = d["level"]["key"]
+        counts[key] = counts.get(key, 0) + 1
+    scored = [d["risk"] for d in devices if d["risk"] is not None]
+    return {
+        "total": len(devices),
+        "counts": counts,
+        "model_ready": model_ready,
+        "no_data": counts["gray"],
+        "mean_risk": round(sum(scored) / len(scored), 4) if scored else None,
+    }
+
+
+def _import_devices(payload):
+    """台账批量导入（CSV 文本 / .xlsx 原文件）。dry_run=True 只做预检不落库。
+
+    预检这一步不能省：台账是唯一一份、导错了没法还原的资产，所以先把「新增几台 /
+    覆盖几台 / 跳过几台 / 多少台会没有数据」摆出来，用户确认后才真写。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    mode = payload.get("mode") or "upsert"
+    if mode not in ("upsert", "skip"):
+        raise ValueError("编号冲突只能选「覆盖」或「跳过」")
+    dry = bool(payload.get("dry_run"))
+
+    b64 = payload.get("xlsx_b64")
+    if b64 is not None:
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            # 前端拼 base64 拼坏了（或请求体被中途截断）时，别把 binascii 的原文甩给班组
+            raise ValueError("Excel 文件没读全，请重新选择文件后再导一次")
+        records, delim, unknown = _read_device_xlsx(raw)
+    else:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("请先选择要导入的 CSV 文件")
+        records, delim, unknown = _read_device_csv(text)
+    if not records:
+        raise ValueError("表头以下没有可导入的数据行")
+    if len(records) > IMPORT_MAX_ROWS:
+        raise _row_cap_error(len(records))
+
+    known = {d["code"] for d in equipment_db.get_all_devices()}
+    tele = set(_latest_telemetry())
+    seen = {}
+    staged, errors = [], []
+    planned = {"add": 0, "update": 0}
+    skipped = 0
+
+    for line_no, rec in records:
+        code = rec.get("code") or ""
+        try:
+            data = _device_form(rec)
+        except ValueError as exc:
+            errors.append({"line": line_no, "code": code or "—", "reason": str(exc)})
+            continue
+        if data["code"] in seen:
+            errors.append({"line": line_no, "code": data["code"],
+                           "reason": "这份文件里编号重复（第 %d 行已经出现过）" % seen[data["code"]]})
+            continue
+        seen[data["code"]] = line_no
+        if data["code"] in known:
+            if mode == "skip":
+                skipped += 1
+                continue
+            action = "update"
+        else:
+            action = "add"
+        staged.append((action, data, line_no))
+        planned[action] += 1
+
+    no_data = sum(1 for _, d, _ in staged if d["code"] not in tele)
+    written, write_errors = ([], [])
+    if not dry:
+        written, write_errors = _write_import_batch(staged)
+        counts_fix = {"add": 0, "update": 0}
+        for act, _, _ in written:
+            counts_fix[act] += 1
+        planned = counts_fix
+        _audit("IMPORT mode=%s added=%d updated=%d skipped=%d failed=%d total=%d"
+               % (mode, planned["add"], planned["update"], skipped,
+                  len(errors) + len(write_errors), len(records)))
+    errors = errors + write_errors
+
+    result = {
+        "ok": True,
+        "dry_run": dry,
+        "mode": mode,
+        "total": len(records),
+        "added": planned["add"],
+        "updated": planned["update"],
+        "skipped": skipped,
+        "failed": len(errors),
+        "errors": errors[:IMPORT_ERROR_SHOWN],
+        "errors_hidden": max(0, len(errors) - IMPORT_ERROR_SHOWN),
+        "unknown": unknown[:20],
+        "delimiter": {"\t": "Tab", "|": "竖线"}.get(delim, delim),
+        "no_data": no_data,
+        "max_rows": IMPORT_MAX_ROWS,
+    }
+    if not dry:
+        result["overview"] = _overview_counts()
+    return result
+
+
+def _import_template_rows():
+    """导入模板：表头 + 两行示例，示例里的类型/状态都取自系统当前可选项。"""
+    def pick(name):
+        return name if name in DEVICE_TYPES else DEVICE_TYPES[0]
+
+    rows = [[IMPORT_HEADER[k] for k in IMPORT_HEADER]]
+    rows.append(["PS-901", "示例·中央泵房1号排水泵", pick("排水泵"), "中央泵房",
+                 "6", "400", "200", "示例电气股份有限公司", "2024-05-06",
+                 DEVICE_STATUS[0], "示例行，导入前请删掉或改成真实设备"])
+    rows.append(["FD-902", "示例·三采区配电点馈电开关", pick("馈电开关"), "三采区配电点",
+                 "1.2", "300", "", "", "", DEVICE_STATUS[0], ""])
+    return rows
 
 
 def _delete_device(payload):
@@ -976,12 +1421,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_csv(self, rows, ascii_name, utf8_name):
+        """带 BOM 的 UTF-8 CSV：Excel 直接双击打开中文不乱码，也不用走导入向导。"""
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\r\n").writerows(rows)
+        data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"; filename*=UTF-8\'\'%s'
+                         % (ascii_name, quote(utf8_name)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _fail(self, exc):
         """非预期异常：详情只进访问日志，不回吐给客户端（避免路径/堆栈泄露）。"""
         _audit("ERROR %s %s\n%s" % (self.command, self.path, traceback.format_exc()))
         self._send_json({"ok": False, "error": "服务内部错误"}, 500)
 
     def _read_json(self):
+        if self.headers.get("Transfer-Encoding"):
+            # 只按 Content-Length 读体，chunked 的请求体读不到；不切断连接的话，
+            # 剩下的分块字节会被当成下一条请求行 —— 那是请求走私的入口。
+            self.close_connection = True
+            raise ValueError("不支持分块传输（chunked）的请求体，请带 Content-Length")
         raw = (self.headers.get("Content-Length") or "0").strip()
         try:
             length = int(raw)
@@ -1002,7 +1467,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             return json.loads(data.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            # 以前这里悄悄当成空请求体（{}）交给业务层，表单式 POST 于是变成
+            # 「字段缺失」的 500 堆栈；协议层的问题就该在协议层回 400。
+            raise ValueError("请求体不是合法的 JSON 对象")
 
     def _send_file(self, rel_name, content_type, cache="max-age=86400"):
         path = os.path.join(RES_DIR, rel_name)
@@ -1042,6 +1509,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file("header.jpg", "image/jpeg")
         elif path == "/logo.png":
             self._send_file("logo.png", "image/png")
+        elif path == "/favicon.ico":
+            # 页面已声明 <link rel="icon" href="/logo.png">，但浏览器仍会兜底请求
+            # /favicon.ico；直接复用 logo，免得 access.log 里一直留 404。
+            self._send_file("logo.png", "image/png")
         elif path == "/api/state":
             try:
                 self._send_json(_state())
@@ -1057,6 +1528,24 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, "result": result})
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, 400)
+            except Exception as exc:
+                self._fail(exc)
+        elif path == "/api/export":
+            try:
+                kind = parse_qs(parsed.query).get("type", [""])[0]
+                if kind not in EXPORT_KINDS:
+                    self._send_json({"ok": False, "error": "未知的导出类型"}, 400)
+                else:
+                    state = _state()
+                    rows = _export_rows(kind, ai_analyze.analyze_global(state, ANALYSIS_HOOKS))
+                    ascii_name, utf8_name = _export_filenames(kind, state.get("ts"))
+                    self._send_csv(rows, ascii_name, utf8_name)
+            except Exception as exc:
+                self._fail(exc)
+        elif path == "/api/device/template.csv":
+            try:
+                self._send_csv(_import_template_rows(),
+                               "equipment_import_template.csv", "设备台账导入模板.csv")
             except Exception as exc:
                 self._fail(exc)
         elif path == "/api/agent/status":
@@ -1133,6 +1622,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._host_denied():
             return
+        if not _origin_ok(self.headers.get("Origin"), self.headers.get("Host")):
+            _audit("CSRF-BLOCK %s origin=%r" % (self.path, self.headers.get("Origin")))
+            self._send_json({"ok": False, "error": "跨站请求已拒绝：请在本平台页面里操作"}, 403)
+            return
         path = urlparse(self.path).path
         try:
             payload = self._read_json()
@@ -1164,6 +1657,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_delete_work_record(payload))
             elif path == "/api/device":
                 self._send_json(_save_device(payload))
+            elif path == "/api/device/import":
+                self._send_json(_import_devices(payload))
             elif path == "/api/device/delete":
                 self._send_json(_delete_device(payload))
             elif path == "/api/env":
