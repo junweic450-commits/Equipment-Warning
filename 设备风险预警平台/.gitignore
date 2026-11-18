@@ -10,8 +10,13 @@ data/
 # 密钥文件：只留在本机，绝不提交
 agent_config.json
 
-# 校准与仿真配置属于现场数据，按需决定是否入库
+# 现场运营数据：台账、校准工况、巷道基准温度，只在本机维护
+#   calibration.json  单台设备的工况校准系数（校准抽屉写它）
+#   sim_config.json   环境基准温度与巷道列表（/api/env 写它）
+# 新机器 clone 后这两个文件不存在也能起来：_load_config() 读到空配置时
+# default_env_base 走 23.0 的默认值、巷道列表为空并在界面上提示先添加。
 calibration.json
+sim_config.json
 
 # 本地虚拟环境，绝不入库
 .venv/

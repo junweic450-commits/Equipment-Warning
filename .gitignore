@@ -4,3 +4,5 @@
 *.db-*
 *.log
 **/agent_config.json
+# macOS 在仓库根目录也会生成 .DS_Store，内层那份 .gitignore 管不到这一层
+.DS_Store
