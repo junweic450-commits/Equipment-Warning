@@ -6,6 +6,12 @@ cd "$(dirname "$0")"
 PY="./.venv/bin/python"
 [ -x "$PY" ] || PY="python3"
 
+if ! command -v "$PY" >/dev/null 2>&1 && [ "$PY" = "python3" ]; then
+    echo "未找到 Python 3，请先安装 Python 3。"
+    read -r -p "按回车键退出..." _
+    exit 1
+fi
+
 echo "=============================================="
 echo " 煤矿排水设备故障风险预警平台（源码版）"
 echo " 使用解释器：$PY"
