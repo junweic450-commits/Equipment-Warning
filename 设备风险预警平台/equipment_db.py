@@ -205,23 +205,63 @@ def _norm_work_value(value):
     return re.sub(r"[\s，,。；;、:：()（）\[\]【】]", "", value)
 
 
+# 维护记录各字段的长度上限（字段名, 界面标签, 上限）。日志正文给到 5000 字，
+# 其余按界面实际用量留出余量；上限集中在下面这一道闸里，入库和改写共用。
+WORK_FIELDS = [
+    ("work_date", "工作日期", 40),
+    ("location", "工作地点", 100),
+    ("equipment", "涉及设备", 200),
+    ("content", "工作内容", 5000),
+    ("result", "处理结果", 500),
+    ("workers", "作业人员", 300),
+    ("source_text", "原始日志", 5000),
+]
+MAX_WORK_RECORDS = 500
+
+
+def clean_work_record(item):
+    """维护记录唯一的长度与格式闸。
+
+    和台账的 _clean 同一个道理：这条闸不该靠每个调用方自己记得卡一遍。
+    之前只有「确认入库」那条路径限了长度，「编辑已有记录」直接绕过它，
+    一条几万字甚至几 MB 的正文就能写进库里。
+    """
+    item = item if isinstance(item, dict) else {}
+    out = {}
+    for key, label, limit in WORK_FIELDS:
+        value = str(item.get(key) or "").strip()
+        if len(value) > limit:
+            raise ValueError("%s不能超过 %d 个字符" % (label, limit))
+        out[key] = value
+    if not out["content"]:
+        raise ValueError("工作内容不能为空")
+    if out["work_date"]:
+        try:
+            datetime.strptime(out["work_date"], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("工作日期格式应为 YYYY-MM-DD")
+    return out
+
+
 def add_work_records(records):
     """确认后写入维护历史。完全重复的记录不新增，只刷新上传时间。"""
+    if not isinstance(records, list):
+        raise ValueError("维护记录格式错误")
+    if len(records) > MAX_WORK_RECORDS:
+        raise ValueError("单次最多写入 %d 条维护记录" % MAX_WORK_RECORDS)
     ids, added, refreshed = [], 0, 0
     now = _now()
     keys = ("work_date", "location", "equipment", "content", "result", "workers")
     with _conn() as c:
         for item in records:
-            content = str(item.get("content") or "").strip()
-            if not content:
-                continue
-            values = {k: str(item.get(k) or "").strip() for k in keys}
+            values = clean_work_record(item)
+            content = values["content"]
             # 先按日期检索候选，再在 Python 中做标准化精确比较，避免相似内容误判。
             candidates = c.execute(
                 "SELECT * FROM work_records WHERE COALESCE(work_date,'')=?",
                 (values["work_date"],)).fetchall()
             duplicate = None
-            source_text = str(item.get("source_text") or content).strip()
+            source_text = values["source_text"] or content
             for row in candidates:
                 same_fields = all(_norm_work_value(row[k]) == _norm_work_value(values[k]) for k in keys)
                 # 即使用户后来编辑过展示字段，重复上传原始日志时仍可用原文识别，且绝不覆盖人工修改。
@@ -265,15 +305,9 @@ def search_work_records(keyword=None, field=None, value=None, limit=1000):
 
 
 def update_work_record(record_id, data):
-    allowed = {"work_date", "location", "equipment", "content", "result", "workers"}
-    values = {k: str(data.get(k) or "").strip() for k in allowed}
-    if not values["content"]:
-        raise ValueError("工作内容不能为空")
-    if values["work_date"]:
-        try:
-            datetime.strptime(values["work_date"], "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("工作日期格式应为 YYYY-MM-DD")
+    """人工编辑已有维护记录。原始日志 source_text 不接受改写，它只用于重复识别。"""
+    values = clean_work_record(data)
+    values.pop("source_text", None)
     values["updated_at"] = _now()
     sets = ",".join(f"{k}=?" for k in values)
     with _conn() as c:

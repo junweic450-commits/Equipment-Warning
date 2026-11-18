@@ -16,14 +16,16 @@ bindWorkLog();
 
 /* ---------------------------------------------------------------- 设备维护信息：工作日志解析、待确认、维护历史检索/编辑/删除 */
 let WORK_DRAFTS = [];
+// 与服务端 equipment_db.WORK_FIELDS 同一套上限：界面先挡住，省得填完提交才报错
+const WORK_LIMIT = {work_date:40, location:100, equipment:200, content:5000, result:500, workers:300};
 function workDraftHTML(r, i){
-  const field = (label, key, value, type) => `<label>${label}</label><input ${type || ""} data-work-index="${i}" data-work-key="${key}" value="${App.esc(value || "")}" />`;
+  const field = (label, key, value, type) => `<label>${label}</label><input maxlength="${WORK_LIMIT[key]||200}" ${type || ""} data-work-index="${i}" data-work-key="${key}" value="${App.esc(value || "")}" />`;
   return `<article class="work-draft">
     <div class="work-draft-hd"><b>待确认维护记录 ${i + 1}</b><label class="work-check"><input type="checkbox" data-work-include="${i}" checked /> 纳入维护历史</label></div>
     <div class="row2"><div>${field("工作日期", "work_date", r.work_date, 'type="date"')}</div><div>${field("工作地点", "location", r.location)}</div></div>
     <div class="row2"><div>${field("涉及设备", "equipment", r.equipment)}</div><div>${field("作业人员", "workers", r.workers)}</div></div>
     ${field("处理结果", "result", r.result)}
-    <label>工作内容</label><textarea rows="3" data-work-index="${i}" data-work-key="content">${App.esc(r.content)}</textarea>
+    <label>工作内容</label><textarea rows="3" maxlength="${WORK_LIMIT.content}" data-work-index="${i}" data-work-key="content">${App.esc(r.content)}</textarea>
   </article>`;
 }
 async function parseWorkLog(){
@@ -58,10 +60,10 @@ function workRecordHTML(r){
     <div class="work-meta">首次入账：${App.esc(r.created_at||"—")}　最后上传：${App.esc(r.upload_at||r.created_at||"—")}${Number(r.duplicate_count)>0?`　重复上传 ${r.duplicate_count} 次`:""}</div>
     <div class="btn-row"><button class="btn ghost small" type="button" onclick="editWorkRecord(${r.id})">编辑</button><button class="btn danger small" type="button" onclick="deleteWorkRecord(${r.id})">删除</button></div>
     <div class="work-edit" id="workEdit${r.id}" hidden>
-      <div class="row2"><div><label>工作日期</label><input type="date" data-edit-key="work_date" value="${App.esc(r.work_date||"")}" /></div><div><label>工作地点</label><input data-edit-key="location" value="${App.esc(r.location||"")}" /></div></div>
-      <div class="row2"><div><label>涉及设备</label><input data-edit-key="equipment" value="${App.esc(r.equipment||"")}" /></div><div><label>作业人员</label><input data-edit-key="workers" value="${App.esc(r.workers||"")}" /></div></div>
-      <label>处理结果</label><input data-edit-key="result" value="${App.esc(r.result||"")}" />
-      <label>工作内容</label><textarea rows="4" data-edit-key="content">${App.esc(r.content||"")}</textarea>
+      <div class="row2"><div><label>工作日期</label><input type="date" maxlength="${WORK_LIMIT.work_date}" data-edit-key="work_date" value="${App.esc(r.work_date||"")}" /></div><div><label>工作地点</label><input maxlength="${WORK_LIMIT.location}" data-edit-key="location" value="${App.esc(r.location||"")}" /></div></div>
+      <div class="row2"><div><label>涉及设备</label><input maxlength="${WORK_LIMIT.equipment}" data-edit-key="equipment" value="${App.esc(r.equipment||"")}" /></div><div><label>作业人员</label><input maxlength="${WORK_LIMIT.workers}" data-edit-key="workers" value="${App.esc(r.workers||"")}" /></div></div>
+      <label>处理结果</label><input maxlength="${WORK_LIMIT.result}" data-edit-key="result" value="${App.esc(r.result||"")}" />
+      <label>工作内容</label><textarea rows="4" maxlength="${WORK_LIMIT.content}" data-edit-key="content">${App.esc(r.content||"")}</textarea>
       <div class="btn-row"><button class="btn small" type="button" onclick="saveWorkRecord(${r.id})">保存修改</button><button class="btn ghost small" type="button" onclick="editWorkRecord(${r.id},false)">取消</button></div>
     </div>
   </article>`;

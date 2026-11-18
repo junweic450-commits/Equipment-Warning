@@ -37,7 +37,7 @@ const MC={
     try{await App.api("/api/model-feedback",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id,feedback_kind,feedback_note,reviewer})});alert("反馈已保存；符合训练条件的样本已进入训练数据池。注意：尚未触发模型训练。");await MC.refresh();}catch(e){alert(e.message);}
   },
   async train(){
-    if(!confirm("将使用原始数据和所有已审核反馈重新训练 HGBT。评估通过后生成待审批候选模型，由管理员确认发布。是否继续？"))return;
+    if(!confirm("将使用原始数据和所有已审核反馈重新训练 HGBT。评估通过后生成待审批候选模型，由管理员确认发布。两次训练至少间隔 60 秒。是否继续？"))return;
     const btn=document.getElementById("mcTrain");btn.disabled=true;btn.textContent="训练中，请稍候…";
     document.getElementById("mcTrainResult").textContent="正在构建数据集、训练并评估候选模型…";
     try{const r=await App.api("/api/model-train",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});const m=r.metrics||{};document.getElementById("mcTrainResult").innerHTML=`<div class="sample"><b>${App.esc(r.version)}：${r.passed?"评估通过，等待管理员审批":"评估未通过"}</b><p>${App.esc(r.message)}</p><div class="sample-values"><span>数据量：${r.dataset_size}</span><span>反馈样本：${r.feedback_count}</span><span>故障召回率：${m.recall==null?"—":(m.recall*100).toFixed(1)+"%"}</span><span>精确率：${m.precision==null?"—":(m.precision*100).toFixed(1)+"%"}</span><span>F1：${m.f1==null?"—":m.f1.toFixed(3)}</span><span>AUC：${m.roc_auc==null?"—":m.roc_auc.toFixed(3)}</span></div></div>`;await MC.refresh();}catch(e){document.getElementById("mcTrainResult").textContent="训练失败："+e.message;}finally{btn.disabled=false;btn.textContent="使用已审核数据训练新模型";}

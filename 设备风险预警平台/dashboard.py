@@ -761,6 +761,11 @@ def _parse_work_log(payload):
         chunks = numbered
     elif not chunks:
         chunks = [raw]
+    if len(chunks) > equipment_db.MAX_WORK_RECORDS:
+        # 解析、确认、入库三处共用同一个条数闸。一次解析出上千条时，浏览器要渲染
+        # 上千张可编辑表单，页签会先卡死，人也不可能逐条核对，所以在这里就让人分批粘贴。
+        raise ValueError("识别到 %d 条，超过单次 %d 条上限，请分批粘贴"
+                         % (len(chunks), equipment_db.MAX_WORK_RECORDS))
     out = []
     for chunk in chunks:
         # 去掉条目前的序号
@@ -790,27 +795,18 @@ def _parse_work_log(payload):
 def _confirm_work_records(payload):
     if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
         raise ValueError("待确认记录格式错误")
+    if len(payload["records"]) > equipment_db.MAX_WORK_RECORDS:
+        raise ValueError("单次最多确认 %d 条维护记录，请分批入库" % equipment_db.MAX_WORK_RECORDS)
     records = []
-    for item in payload["records"]:
+    for i, item in enumerate(payload["records"], 1):
         if not isinstance(item, dict):
             continue
-        date_text = str(item.get("work_date") or "").strip()
-        if date_text:
-            _check_date(date_text)
-        def short(k, limit):
-            value = str(item.get(k) or "").strip()
-            if len(value) > limit:
-                raise ValueError("%s不能超过%d个字符" % (k, limit))
-            return value
-        content = short("content", 5000)
-        if not content:
-            continue
-        records.append({
-            "work_date": date_text, "location": short("location", 100),
-            "equipment": short("equipment", 200), "content": content,
-            "result": short("result", 500), "workers": short("workers", 300),
-            "source_text": short("source_text", 5000),
-        })
+        if not str(item.get("content") or "").strip():
+            continue          # 界面上留空的草稿直接跳过，和原行为一致
+        try:
+            records.append(equipment_db.clean_work_record(item))
+        except ValueError as exc:
+            raise ValueError("第 %d 条维护记录：%s" % (i, exc))
     if not records:
         raise ValueError("请至少选择一条有效记录")
     with _STORE_LOCK:
@@ -819,25 +815,35 @@ def _confirm_work_records(payload):
     return {"ok": True, **result, "count": result["added"] + result["refreshed"]}
 
 
+def _work_record_id(payload):
+    """记录编号：非数字要回 400，不能让 int() 的 TypeError 变成 500。"""
+    try:
+        return int(str(payload.get("id")).strip())
+    except (TypeError, ValueError):
+        raise ValueError("维护记录编号无效")
+
+
 def _update_work_record(payload):
-    if not isinstance(payload, dict) or not payload.get("id"):
-        raise ValueError("维护记录编号缺失")
+    if not isinstance(payload, dict):
+        raise ValueError("维护记录格式错误")
+    record_id = _work_record_id(payload)
     with _STORE_LOCK:
-        ok = equipment_db.update_work_record(payload["id"], payload)
+        ok = equipment_db.update_work_record(record_id, payload)
     if not ok:
         raise ValueError("维护记录不存在或已被删除")
-    _audit("WORK_RECORD UPDATE id=%s" % payload["id"])
+    _audit("WORK_RECORD UPDATE id=%s" % record_id)
     return {"ok": True}
 
 
 def _delete_work_record(payload):
-    if not isinstance(payload, dict) or not payload.get("id"):
-        raise ValueError("维护记录编号缺失")
+    if not isinstance(payload, dict):
+        raise ValueError("维护记录格式错误")
+    record_id = _work_record_id(payload)
     with _STORE_LOCK:
-        ok = equipment_db.delete_work_record(payload["id"])
+        ok = equipment_db.delete_work_record(record_id)
     if not ok:
         raise ValueError("维护记录不存在或已被删除")
-    _audit("WORK_RECORD DELETE id=%s" % payload["id"])
+    _audit("WORK_RECORD DELETE id=%s" % record_id)
     return {"ok": True}
 
 

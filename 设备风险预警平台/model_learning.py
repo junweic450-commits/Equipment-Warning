@@ -192,9 +192,33 @@ def _training_frame():
     return base, len(rows), feature_cols, target_col
 
 
+TRAIN_MIN_INTERVAL_SECONDS = 60
+
+
+def _cooldown_seconds():
+    """距上一次训练还差多少秒。
+
+    每次训练都要重建数据集并全量重拟合，重复点一下就是白吃一轮 CPU、白留一份记录；
+    平台上没有任何登录，所以这一层按时间闸住，而不是指望前端把按钮禁用住。
+    """
+    with _connect() as c:
+        row = c.execute("SELECT created_at FROM model_training_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if not row or not row["created_at"]:
+        return 0
+    try:
+        last = datetime.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0
+    return TRAIN_MIN_INTERVAL_SECONDS - (datetime.now() - last).total_seconds()
+
+
 def train_candidate(default_model_path):
     """训练候选版本并评估；只有通过保护阈值才自动发布。"""
     with _LOCK:
+        wait = _cooldown_seconds()
+        if wait > 0:
+            raise ValueError("两次训练至少间隔 %d 秒，请在 %d 秒后再试"
+                             % (TRAIN_MIN_INTERVAL_SECONDS, int(wait) + 1))
         df, feedback_count, feature_cols, target_col = _training_frame()
         if len(df)<20 or df[target_col].nunique()<2:
             raise ValueError("有效训练数据不足：至少需要 20 条且同时包含正常和故障样本")
@@ -242,13 +266,16 @@ def train_candidate(default_model_path):
                 passed=False; reasons.append("ROC-AUC 较当前模型下降超过 0.02")
         status="pending_approval" if passed else "candidate_rejected"
         message="评估通过，等待管理员审批发布" if passed else "；".join(reasons)
-        # 评估通过后用全部已审核样本拟合候选模型，但不自动替换线上模型。
-        deploy_model = candidate
+        # 只有评估通过、真的可能被批准的候选才落盘：candidate_rejected 既不能发布
+        # （publish 只认 pending_approval）也不能回滚（rollback 只认 published），
+        # 文件写出来就永远没有引用方，每点一次训练白占几百 KB 磁盘。
+        rel_path = ""
         if passed:
+            # 用全部已审核样本重新拟合一次作为上线候选，但不自动替换线上模型。
             deploy_model = ai_model.train_model(
                 df[feature_cols], df[target_col], ["type"], save_path="", class_weight="balanced")
-        ai_model.joblib.dump(deploy_model,str(model_file))
-        rel_path=str(model_file.relative_to(root))
+            ai_model.joblib.dump(deploy_model, str(model_file))
+            rel_path = str(model_file.relative_to(root))
         with _connect() as c:
             c.execute("INSERT INTO model_training_runs(version,status,model_path,dataset_size,feedback_count,metrics_json,message,created_at) VALUES(?,?,?,?,?,?,?,?)",
                 (version,status,rel_path,len(df),feedback_count,json.dumps(metrics,ensure_ascii=False),message,_now()))
