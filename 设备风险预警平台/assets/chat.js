@@ -21,6 +21,22 @@ const QA = {
 
 const QA_KEY = "qa.history.v1";
 
+/* 悬浮球：位置（视口 left/top）单独存 localStorage，刷新和换页都停在用户放的地方 */
+const FAB_KEY = "qa.fab.pos.v1";
+const FAB_MARGIN = 14;
+const NARROW = window.matchMedia("(max-width:640px)");
+
+/* 会话气泡 + 星芒，配文字标签，一眼能认出是问答入口。
+   纯常量标记，不拼任何动态内容。 */
+const FAB_HTML = `<svg class="fi" viewBox="0 0 24 24" aria-hidden="true" focusable="false">`
+  + `<rect x="2.2" y="5.4" width="17.4" height="12.6" rx="3.6" fill="none" stroke="currentColor" stroke-width="1.8"/>`
+  + `<path d="M7.4 17.6v4.2l4.3-4.2z" fill="currentColor"/>`
+  + `<path d="M10.9 8.4l.95 2.45 2.45.95-2.45.95-.95 2.45-.95-2.45-2.45-.95 2.45-.95z" fill="currentColor"/>`
+  + `<path d="M20.6 1.1l.55 1.5 1.5.55-1.5.55-.55 1.5-.55-1.5-1.5-.55 1.5-.55z" fill="currentColor" opacity=".85"/>`
+  + `</svg><span class="ft">智能问答</span>`;
+
+let suppressFabClick = false;
+
 const QUICK = [
   "今天最该处理什么？",
   "风险最高的那台为什么高？",
@@ -97,16 +113,17 @@ function mount(){
   fab.className = "fab";
   fab.id = "qaFab";
   fab.type = "button";
-  fab.title = "问 AI";
-  fab.setAttribute("aria-label", "打开问 AI");
-  fab.textContent = "✦";
+  fab.setAttribute("draggable", "false");
+  fab.title = "智能问答 · 按住可拖动位置";
+  fab.setAttribute("aria-label", "打开智能问答，按住可拖动位置");
+  fab.innerHTML = FAB_HTML;
 
   const panel = document.createElement("section");
   panel.className = "qa";
   panel.id = "qaPanel";
-  panel.setAttribute("aria-label", "问 AI");
+  panel.setAttribute("aria-label", "智能问答");
   panel.innerHTML = `
-    <div class="qa-hd"><b>问 AI</b><span class="hint" style="margin:0;color:rgba(255,255,255,.85)" id="qaModel"></span>
+    <div class="qa-hd"><b>智能问答</b><span class="hint" style="margin:0;color:rgba(255,255,255,.85)" id="qaModel"></span>
       <button class="x" type="button" id="qaClose">关闭 ✕</button></div>
     <div class="qa-ctx" id="qaCtx"></div>
     <div class="qa-body" id="qaBody"></div>
@@ -119,7 +136,13 @@ function mount(){
   document.body.appendChild(panel);
   QA.node = panel;
 
-  fab.addEventListener("click", () => QA.shown ? closePanel() : openPanel());
+  const saved = savedFabPos();
+  if (saved) placeFab(saved.x, saved.y);
+  bindFabDrag(fab);
+  fab.addEventListener("click", () => {
+    if (suppressFabClick) return;   /* 拖动结束紧跟的那次 click 不算打开 */
+    QA.shown ? closePanel() : openPanel();
+  });
   /* 这里原来绑的是 close —— IIFE 里没有这个名字，实际取到的是 window.close()，
      浏览器不允许脚本关掉用户自己打开的标签页，所以点"关闭 ✕"看起来没反应。 */
   byId("qaClose").addEventListener("click", closePanel);
@@ -136,14 +159,138 @@ function mount(){
   byId("qaCtx").addEventListener("click", e => {
     if (e.target.id === "qaClearCtx"){ QA.code = ""; renderCtx(); }
   });
-  if (window.visualViewport){
-    window.visualViewport.addEventListener("resize", () => {
-      if (!QA.shown) return;
-      panel.style.bottom = Math.max(86, 86 + (window.innerHeight - window.visualViewport.height)) + "px";
-    });
-  }
+  /* 视口变化（缩窗、软键盘）后把球夹回屏内、面板重贴一次 */
+  const onViewChange = () => {
+    reclampFab();
+    if (QA.shown) placePanel();
+  };
+  window.addEventListener("resize", onViewChange);
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", onViewChange);
+  if (NARROW.addEventListener) NARROW.addEventListener("change", onViewChange);
   loadHistory();
   refreshChip();
+}
+
+/* ---------------------------------------------------------------- 悬浮球拖动 */
+function fabEl(){ return document.getElementById("qaFab"); }
+
+/* position:fixed 的包含块是不含滚动条的那块视口，window.innerWidth 却把滚动条算进去，
+   直接用 innerWidth 夹取会让球压住右侧滚动条约 15px。 */
+function viewW(){ return Math.min(window.innerWidth, document.documentElement.clientWidth || window.innerWidth); }
+function viewH(){ return Math.min(window.innerHeight, document.documentElement.clientHeight || window.innerHeight); }
+
+function clampFab(x, y){
+  const el = fabEl();
+  const maxX = Math.max(FAB_MARGIN, viewW() - el.offsetWidth - FAB_MARGIN);
+  const maxY = Math.max(FAB_MARGIN, viewH() - el.offsetHeight - FAB_MARGIN);
+  return [Math.min(Math.max(x, FAB_MARGIN), maxX), Math.min(Math.max(y, FAB_MARGIN), maxY)];
+}
+
+function placeFab(x, y){
+  const el = fabEl();
+  if (!el) return;
+  const p = clampFab(x, y);
+  el.style.left = p[0] + "px";
+  el.style.top = p[1] + "px";
+  el.style.right = "auto";
+  el.style.bottom = "auto";
+}
+
+/* 直接读内联值，别绕 getBoundingClientRect —— :hover 的 scale 会把 rect 放大几 px */
+function fabPos(el){ return [parseFloat(el.style.left) || 0, parseFloat(el.style.top) || 0]; }
+
+/* 没拖过的球由 CSS 的 right/bottom 定位，缩窗天然不会跑出屏幕 */
+function reclampFab(){
+  const el = fabEl();
+  if (!el || el.style.left === "") return;
+  const p = fabPos(el);
+  placeFab(p[0], p[1]);
+}
+
+function savedFabPos(){
+  try{
+    const p = JSON.parse(localStorage.getItem(FAB_KEY) || "null");
+    return (p && Number.isFinite(p.x) && Number.isFinite(p.y)) ? p : null;
+  }catch(e){ return null; }
+}
+
+function saveFabPos(el){
+  try{ localStorage.setItem(FAB_KEY, JSON.stringify({x: fabPos(el)[0], y: fabPos(el)[1]})); }
+  catch(e){ /* 隐私模式忽略 */ }
+}
+
+function bindFabDrag(el){
+  /* move/up 绑在 window 上而不是球上：球一旦跟着指针走，指针就会跑到球外面，
+     绑在球上就再也收不到 pointermove，拖动只走一小步就断了。
+     dragstart 也拦掉：按住不放划过页面上的 <a> 或图片时，浏览器会抢去发起
+     原生拖拽，紧跟着就是一个 pointercancel，自定义拖动当场断在半路。 */
+  el.addEventListener("pointerdown", e => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    const r = el.getBoundingClientRect();
+    /* 已经拖过的球直接读内联值，省得 :hover 的缩放把起点带偏、每次拖动再累积几 px */
+    const p = el.style.left !== "" ? fabPos(el) : [r.left, r.top];
+    const st = {id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: p[0], oy: p[1], moved: false};
+    const noDrag = ev => ev.preventDefault();
+    const move = ev => {
+      if (ev.pointerId !== st.id) return;
+      const dx = ev.clientX - st.sx, dy = ev.clientY - st.sy;
+      if (!st.moved && Math.abs(dx) + Math.abs(dy) < 5) return;   /* 手抖不算拖动 */
+      if (!st.moved){ st.moved = true; el.classList.add("dragging"); }
+      placeFab(st.ox + dx, st.oy + dy);
+      if (QA.shown) placePanel();
+    };
+    const stop = ev => {
+      if (ev.pointerId !== st.id) return;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("dragstart", noDrag, true);
+      el.classList.remove("dragging");
+      if (st.moved){
+        saveFabPos(el);
+        suppressFabClick = true;
+        setTimeout(() => { suppressFabClick = false; }, 0);
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("dragstart", noDrag, true);
+  });
+}
+
+/* 面板贴球展开：球在右半边就右对齐、在左半边就左对齐；上方放不下就往下开，
+   两边都放不下时把面板压到放得下的那一侧的高度，保证不把球盖住。 */
+function placePanel(){
+  const panel = byId("qaPanel"), fab = fabEl();
+  if (!panel || !fab) return;
+  const vh = viewH();
+  const kb = Math.max(0, vh - (window.visualViewport ? window.visualViewport.height : vh));
+  if (NARROW.matches){
+    /* 窄屏走整幅底部抽屉样式，只把软键盘挡掉的那截补回来 */
+    panel.style.left = panel.style.top = panel.style.right = panel.style.height = "";
+    panel.style.bottom = kb ? kb + "px" : "";
+    return;
+  }
+  const vw = viewW(), m = 12, gap = 12;
+  const r = fab.getBoundingClientRect();
+  const w = panel.offsetWidth || Math.min(392, vw - 24);
+  const maxH = Math.min(560, vh * .7);
+  let h = maxH, y;
+  const roomAbove = r.top - gap - m;
+  const roomBelow = vh - kb - r.bottom - gap - m;
+  if (roomAbove >= h) y = r.top - h - gap;
+  else if (roomBelow >= h) y = r.bottom + gap;
+  else if (roomAbove >= roomBelow){ y = m; h = Math.max(240, roomAbove); }
+  else { y = r.bottom + gap; h = Math.max(240, roomBelow); }
+  let x = (r.left + r.width / 2) > vw / 2 ? r.right - w : r.left;
+  x = Math.min(Math.max(x, m), Math.max(m, vw - w - m));
+  y = Math.min(Math.max(y, m), Math.max(m, vh - kb - h - m));
+  panel.style.left = x + "px";
+  panel.style.top = y + "px";
+  panel.style.right = "auto";
+  panel.style.bottom = "auto";
+  panel.style.height = h + "px";   /* 显式写高，省得 70vh 和去掉滚动条的高度对不上 */
 }
 
 function byId(id){ return document.getElementById(id); }
@@ -153,6 +300,7 @@ function openPanel(){
   QA.shown = true;
   byId("qaPanel").classList.add("on");
   byId("qaFab").classList.add("on");
+  placePanel();
   renderCtx();
   setTimeout(() => byId("qaText").focus(), 60);
 }
@@ -173,12 +321,14 @@ function openWithDevice(code){
 }
 
 /* ---------------------------------------------------------------- 会话渲染 */
-/* 上下文那行小字：页签名和顶部导航保持一致（/risk 已改名「智能分析」） */
-const PAGE_LABEL = {"/": "风险概览", "/risk": "智能分析", "/devices": "设备台账"};
+/* 上下文那行小字：五个页面都有问答入口了，这里的名字必须和顶部导航一致
+   （/risk 已改名「智能分析」），对不上的路径别再冒充「设备台账」。 */
+const PAGE_LABEL = {"/": "风险概览", "/risk": "智能分析", "/devices": "设备台账",
+  "/report": "今日报告", "/model-center": "模型训练中心"};
 
 function pageLabel(){
   const here = location.pathname.replace(/\.html$/, "") || "/";
-  return PAGE_LABEL[here] || "设备台账";
+  return PAGE_LABEL[here] || "本页";
 }
 
 function renderCtx(){
