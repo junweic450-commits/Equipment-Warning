@@ -148,16 +148,24 @@ tr:hover td{background:#f9fcff}
 .pg.on{background:var(--blue-700);border-color:var(--blue-700);color:#fff;font-weight:700}
 .pg:disabled{opacity:.45;cursor:default}
 .pg-ell{color:var(--muted);font-size:12.5px;padding:0 2px}
+/* ---------- 快捷入口行（首页底部两条链接）---------- */
+.more-row{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin-top:12px}
+.more-label{font-size:12.5px;color:var(--muted);font-weight:600}
+.more-row[hidden]{display:none}
 
 /* ---------- 抽屉与遮罩 ---------- */
 .mask{position:fixed;inset:0;background:rgba(8,32,60,.45);display:none;z-index:50}
 .mask.on{display:block}
 /* 这里一律用 100%（相对固定定位的包含块，已扣掉滚动条），不用 100vw：
    100vw 含滚动条宽度，窄屏上抽屉会整体左溢十几像素，左边框被裁掉。 */
+/* 只靠 transform 移出视口，抽屉里的输入框仍然在 Tab 序列里：实测在首页连按 Tab
+   会走进已经关掉的「校准工况」抽屉，焦点停在屏幕外（看不见也摸不着）。补一条
+   visibility:hidden 把它们移出焦点序列；关的时候延迟 0.22s 生效，滑出动画照样走完。 */
 .drawer{position:fixed;top:0;right:0;height:100%;width:min(480px,100%);background:#fff;z-index:51;
-  transform:translateX(102%);transition:.22s;padding:22px clamp(16px,2vw,24px);overflow:auto;
+  transform:translateX(102%);transition:.22s,visibility 0s .22s;visibility:hidden;
+  padding:22px clamp(16px,2vw,24px);overflow:auto;
   box-shadow:-12px 0 30px rgba(8,32,60,.18)}
-.drawer.on{transform:none}
+.drawer.on{transform:none;visibility:visible;transition:.22s,visibility 0s 0s}
 .drawer h2{margin:0 0 6px;font-size:18px}
 .drawer h4{margin:18px 0 6px;font-size:14px;color:var(--ai-1)}
 

@@ -230,10 +230,11 @@ function renderCards(){
   if (has("cardsMore")){
     const more = byId("cardsMore");
     more.innerHTML = all.length
-      ? `<a class="link" href="/risk">完整归因与治理方案 → 智能分析</a>` +
-        `<a class="link" href="/devices">录入与维护 → 设备台账</a>`
+      ? `<span class="more-label">快捷入口</span>` +
+        `<a class="link" href="/risk">智能分析（归因与治理方案）</a>` +
+        `<a class="link" href="/devices">设备台账（录入与维护）</a>`
       : "";
-    more.style.display = all.length ? "flex" : "none";
+    more.hidden = !all.length;
   }
 }
 
@@ -390,13 +391,13 @@ async function submitForm(){
   const payload = {
     code: get("f_code").trim(),
     name: get("f_name").trim(),
-    type: get("f_type").value,
+    type: get("f_type"),
     location: get("f_location").trim(),
     rated_v: parseFloat(get("f_rated_v")),
     rated_i: parseFloat(get("f_rated_i")),
     rated_p: parseFloat(get("f_rated_p")),
     commission_date: get("f_commission"),
-    status: get("f_status").value,
+    status: get("f_status"),
     maker: get("f_maker").trim(),
     remark: get("f_remark").trim(),
   };
