@@ -1,9 +1,0 @@
-{
-  "enabled": true,
-  "base_url": "https://maas-api.unisound.com/v1",
-  "api_key": "tp-nnpwja8h4rx4od3j8e8jhexj3dpet2a485iqdefemt8j87u3",
-  "model": "u2-flash",
-  "timeout": 60,
-  "temperature": 0.3,
-  "max_history": 12
-}
