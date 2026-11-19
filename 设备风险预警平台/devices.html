@@ -35,7 +35,8 @@
       额定电压 / 电流必须大于 0，填 0 会带着 0 去算风险，分级就不可信了。
       实测列取的是历史运行记录里最新一条，新录的设备没有记录时先显示「无数据」。
       「解读」看单台为什么高、怎么降，「校准」改潮湿粉尘这些现场填报项。
-      设备多了按每页条数翻页，搜索和分级筛选会一起算页数。</div>
+      设备多了按每页条数翻页，搜索和分级筛选会一起算页数。
+      <span data-hm-note></span></div>
 
     <div class="filter-row">
       <input id="devSearch" type="search" placeholder="搜编号 / 名称 / 巷道 / 厂家，如 PU-001" autocomplete="off" />
@@ -49,6 +50,7 @@
       </select>
       <button class="btn ghost small" id="devFilterClear" type="button">清空筛选</button>
     </div>
+    <div class="hm-note" id="hmNote"></div>
     <div id="tableWrap"></div>
     <div id="tablePager"></div>
 

@@ -357,14 +357,19 @@ async function loadGlobal(btn){
   return AI.global;
 }
 
+/* 状态灯的唯一取数口：问答那边已经拿到一份时直接递过来（applyAgentStatus），
+   没有就自己取一次。以前是 chat 取一遍、这里再取一遍，一次刷新打两次接口。 */
+function applyAgentStatus(s){
+  AI.agent = s || {ready: false, reason: "状态接口不可用"};
+  refreshStatus();
+}
+
 async function loadAgentStatus(){
   try{
-    const r = await fetch("/api/agent/status", {cache: "no-store"});
-    AI.agent = await r.json();
+    applyAgentStatus(await App.api("/api/agent/status"));
   }catch(e){
-    AI.agent = {ready: false, reason: "状态接口不可用"};
+    applyAgentStatus(null);
   }
-  refreshStatus();
 }
 
 /* ---------------------------------------------------------------- Agent 补充 */
@@ -442,9 +447,8 @@ window.SmartAnalysis = {
       drawer.innerHTML = `<h2>AI 解读</h2><div class="ai-err">解读失败：${aiEsc(e.message)}</div>`;
     }
   },
-  /* 一次 Agent 调用结束后刷新状态灯：欠费/限流这类问题只有调过才知道，
-     调完立刻让看板反映出来，不用等下一次轮询。 */
-  refreshAgentStatus: loadAgentStatus,
+  /* 状态灯的对外入口只有一个：谁拿到了 status 载荷谁递进来，不再各取一遍。 */
+  applyAgentStatus,
   refresh: loadGlobal,
 };
 

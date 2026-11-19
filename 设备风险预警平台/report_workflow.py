@@ -1,5 +1,4 @@
 """人工核实日报及可追溯处置记录。"""
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -7,23 +6,21 @@ import equipment_db
 import model_learning
 
 
-@contextmanager
-def _connect():
-    c = sqlite3.connect(equipment_db.DB_PATH, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA busy_timeout=30000")
-    c.execute("""CREATE TABLE IF NOT EXISTS daily_risk_reports (
+_REPORT_DDL = """CREATE TABLE IF NOT EXISTS daily_risk_reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         report_date TEXT NOT NULL, code TEXT NOT NULL, sim_time TEXT NOT NULL,
         status TEXT NOT NULL, cause TEXT NOT NULL DEFAULT '', action TEXT NOT NULL DEFAULT '',
         raw_value TEXT NOT NULL DEFAULT '', corrected_value TEXT NOT NULL DEFAULT '',
         reviewer TEXT NOT NULL DEFAULT '', sample_id INTEGER, updated_at TEXT NOT NULL,
-        UNIQUE(report_date, code, sim_time))""")
-    try:
+        UNIQUE(report_date, code, sim_time))"""
+
+
+@contextmanager
+def _connect():
+    """连接口径用数据层那一份，日报这张表只在自己模块里补齐。"""
+    with equipment_db.connect() as c:
+        c.execute(_REPORT_DDL)
         yield c
-        c.commit()
-    finally:
-        c.close()
 
 
 def daily_snapshot(state):

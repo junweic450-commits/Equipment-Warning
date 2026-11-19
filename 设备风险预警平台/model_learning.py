@@ -2,14 +2,16 @@
 
 反馈先入池；只有已确认的正常/故障标签参与监督训练。
 HGBT 不支持 partial_fit，因此采用历史数据 + 已审核反馈的批量重训练。
+
+判断为「确认故障」的那一次点击，顺手把两个新标签也收进同一道审核闸：
+是哪种故障、这条记录之后实际还能跑多久。它们换算成一条已确认失效事件写进
+fault_events —— 故障分类与剩余寿命的训练侧只认事件表，不再另开一套标签库。
 """
 import json
 import os
-import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from contextlib import contextmanager
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -17,26 +19,14 @@ from sklearn.model_selection import train_test_split
 import ai_model
 import dataset_builder
 import equipment_db
+import model_runs
 
 _LOCK = threading.RLock()
 FEATURES = list(dataset_builder.FEATURE_COLS)
 
 
-def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-@contextmanager
-def _connect():
-    os.makedirs(equipment_db.DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(equipment_db.DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=30000")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+_connect = equipment_db.connect
+_now = equipment_db.stamp
 
 
 def init_db():
@@ -53,6 +43,9 @@ def init_db():
             feedback_kind TEXT NOT NULL DEFAULT 'pending',
             feedback_note TEXT DEFAULT '',
             reviewer TEXT DEFAULT '',
+            fault_type TEXT,
+            actual_rul_hours REAL,
+            event_id INTEGER,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL,
             reviewed_at TEXT,
@@ -77,6 +70,12 @@ def init_db():
             c.execute("ALTER TABLE model_training_runs ADD COLUMN approved_by TEXT DEFAULT ''")
         if "approved_at" not in columns:
             c.execute("ALTER TABLE model_training_runs ADD COLUMN approved_at TEXT")
+        # 类型标签与实际剩余小时是后加的三列。加列不改动任何已有行，老库里已审核过的
+        # 正常/故障结论原样保留，只是多的那两个标签从这次之后才开始收。
+        fb_cols = {r[1] for r in c.execute("PRAGMA table_info(model_feedback_samples)").fetchall()}
+        for col, ddl in (("fault_type", "TEXT"), ("actual_rul_hours", "REAL"), ("event_id", "INTEGER")):
+            if col not in fb_cols:
+                c.execute("ALTER TABLE model_feedback_samples ADD COLUMN %s %s" % (col, ddl))
 
 
 def active_model_path(default_path):
@@ -134,6 +133,87 @@ def list_samples(status="all", limit=500):
         return {"samples":out,"counts":counts}
 
 
+ACTUAL_HOURS_MAX = 24 * 180      # 半年以外的「还能跑多久」，现场不会据此安排检修
+
+
+def _parse_actual_hours(raw):
+    text = str(raw if raw is not None else "").strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError("实际剩余小时要填数字，读到的是「%s」" % text[:20])
+    if not 0 <= value <= ACTUAL_HOURS_MAX:
+        raise ValueError("实际剩余小时应在 0～%d 小时之间" % ACTUAL_HOURS_MAX)
+    return round(value, 1)
+
+
+def _fail_time(sim_time, actual_hours):
+    """快照时刻 + 人工给的实际剩余小时 = 真正的失效时刻；换算不了就明说，不悄悄退化成估算。"""
+    base = equipment_db.normalize_event_time(sim_time, "这条快照的采样时间")
+    if not base:
+        raise ValueError("这条快照没有可用的采样时间，推算不出失效时间")
+    dt = datetime.strptime(base, "%Y-%m-%d %H:%M:%S")
+    if actual_hours:
+        dt = dt + timedelta(hours=float(actual_hours))
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _find_event(code, fail_time):
+    row = equipment_db.find_event_by_time("fault_events", code, fail_time)
+    return None if not row else {"id": int(row["id"]), "source": row["source"]}
+
+
+def _sync_fault_event(sample, fault_type, actual_hours, note, reviewer):
+    """把「确认故障」的审核结论落成一条已确认失效事件：标签只进事件表，训练只认事件表。
+
+    同一条样本反复改判只修正它自己那一条事件（靠 event_id 认），不会每次点击堆一条新的；
+    撞上一条人工录入的失效事件时绝不覆盖——人工确认过的记录只有人工操作才能变。
+    """
+    item = {"code": sample["code"], "fail_time": _fail_time(sample["sim_time"], actual_hours),
+            "fault_type": fault_type, "action": (note or "")[:500],
+            "note": "由反馈样本 #%s 确认生成" % sample["id"]}
+    clean = equipment_db.clean_event_record("fault_events", item)   # 先过一遍闸，不合格就别动审核
+    linked = sample.get("event_id")
+    if linked and equipment_db.update_event_record("fault_events", linked, clean, reviewer=reviewer):
+        return {"id": int(linked), "action": "updated", "fault_type": clean["fault_type"],
+                "fail_time": clean["fail_time"]}
+    found = _find_event(clean["code"], clean["fail_time"])
+    if found and found["source"] != "feedback":
+        return {"id": found["id"], "action": "kept_manual", "fault_type": clean["fault_type"],
+                "fail_time": clean["fail_time"]}
+    if found:
+        equipment_db.update_event_record("fault_events", found["id"], clean, reviewer=reviewer)
+        return {"id": found["id"], "action": "updated", "fault_type": clean["fault_type"],
+                "fail_time": clean["fail_time"]}
+    res = equipment_db.add_event_records("fault_events", [clean], source="feedback",
+                                         reviewer=reviewer, status="confirmed")
+    if res["added"]:
+        return {"id": int(res["ids"][0]), "action": "added", "fault_type": clean["fault_type"],
+                "fail_time": clean["fail_time"]}
+    again = _find_event(clean["code"], clean["fail_time"])
+    return {"id": (again or {}).get("id"), "action": "kept_manual",
+            "fault_type": clean["fault_type"], "fail_time": clean["fail_time"]}
+
+
+def _feedback_message(kind, event, sample, fault_type):
+    if kind != "fault":
+        if sample.get("event_id") and kind in ("normal", "anomaly"):
+            return ("反馈已保存；之前由这条样本生成的失效事件仍留在「故障事件」里，"
+                    "人工确认过的记录只有人工删除才消失。")
+        return "反馈已保存；符合训练条件的样本已进入训练数据池。"
+    if not fault_type:
+        return "已记下故障标签，但没选故障类型，所以没有生成失效事件——类型标签还差这一步。"
+    if not event:
+        return "反馈已保存。"
+    done = {"added": "已同步生成 1 条已确认失效事件",
+            "updated": "已同步修正对应的失效事件",
+            "kept_manual": "同一时刻已有一条人工录入的失效事件，未覆盖（要改类型请到「故障事件」里改）"}[event["action"]]
+    return "%s（%s · %s）；故障分类与剩余寿命都直接从事件表取标签。" % (
+        done, event["fault_type"], event["fail_time"])
+
+
 def save_feedback(payload):
     if not isinstance(payload, dict):
         raise ValueError("反馈内容格式错误")
@@ -147,15 +227,37 @@ def save_feedback(payload):
     reviewer=str(payload.get("reviewer") or "").strip()
     if len(note)>1000 or len(reviewer)>80:
         raise ValueError("反馈说明或人员名称过长")
+    fault_type=str(payload.get("fault_type") or "").strip()
+    actual_hours=_parse_actual_hours(payload.get("actual_hours"))
+    if kind != "fault" and (fault_type or actual_hours is not None):
+        raise ValueError("只有判断为「确认设备故障」时才需要填故障类型与实际剩余小时")
+    # 别名只允许停在输入那一刻：样本与事件表存同一份标准名，否则下拉框回显不出已存的值，
+    # 审核人看到的就和他刚确认的不是一回事。
+    fault_type = equipment_db.normalize_fault_type(fault_type)
     label=allowed[kind]
     status="reviewed" if kind != "uncertain" else "pending"
-    with _connect() as c:
+    with _LOCK, _connect() as c:
+        row = c.execute("SELECT * FROM model_feedback_samples WHERE id=?", (sample_id,)).fetchone()
+        if not row:
+            raise ValueError("反馈样本不存在")
+        sample = dict(row)
+    event = None
+    if kind == "fault" and fault_type:
+        event = _sync_fault_event(sample, fault_type, actual_hours, note, reviewer)
+    # 只把「这条样本自己生成/修正的那条事件」挂回样本上；撞见别人人工录的同刻事件时
+    # 不挂链接，否则下次改判就会顺着链接改掉别人的记录。
+    own_id = (event or {}).get("id") if (event or {}).get("action") in ("added", "updated") else None
+    with _LOCK, _connect() as c:
         cur=c.execute("""UPDATE model_feedback_samples SET feedback_label=?,feedback_kind=?,
-            feedback_note=?,reviewer=?,status=?,reviewed_at=? WHERE id=?""",
-            (label,kind,note,reviewer,status,_now() if status=="reviewed" else None,sample_id))
+            feedback_note=?,reviewer=?,status=?,reviewed_at=?,fault_type=?,actual_rul_hours=?,event_id=?
+            WHERE id=?""",
+            (label,kind,note,reviewer,status,_now() if status=="reviewed" else None,
+             fault_type or None, actual_hours,
+             own_id or sample.get("event_id"), sample_id))
         if not cur.rowcount:
             raise ValueError("反馈样本不存在")
-    return {"ok":True,"status":status}
+    return {"ok":True,"status":status,"event":event,
+            "message":_feedback_message(kind, event, sample, fault_type)}
 
 
 def _training_frame():
@@ -192,11 +294,8 @@ def _training_frame():
     return base, len(rows), feature_cols, target_col
 
 
-TRAIN_MIN_INTERVAL_SECONDS = 60
-
-
 def _cooldown_seconds():
-    """距上一次训练还差多少秒。
+    """距上一次训练还差多少秒；间隔与提示语都在 model_runs，两套模型共用一个口径。
 
     每次训练都要重建数据集并全量重拟合，重复点一下就是白吃一轮 CPU、白留一份记录；
     平台上没有任何登录，所以这一层按时间闸住，而不是指望前端把按钮禁用住。
@@ -204,12 +303,12 @@ def _cooldown_seconds():
     with _connect() as c:
         row = c.execute("SELECT created_at FROM model_training_runs ORDER BY id DESC LIMIT 1").fetchone()
     if not row or not row["created_at"]:
-        return 0
+        return 0.0
     try:
         last = datetime.strptime(str(row["created_at"])[:19], "%Y-%m-%d %H:%M:%S")
     except ValueError:
-        return 0
-    return TRAIN_MIN_INTERVAL_SECONDS - (datetime.now() - last).total_seconds()
+        return 0.0
+    return model_runs.wait_left(last.timestamp())
 
 
 def train_candidate(default_model_path):
@@ -217,8 +316,7 @@ def train_candidate(default_model_path):
     with _LOCK:
         wait = _cooldown_seconds()
         if wait > 0:
-            raise ValueError("两次训练至少间隔 %d 秒，请在 %d 秒后再试"
-                             % (TRAIN_MIN_INTERVAL_SECONDS, int(wait) + 1))
+            raise model_runs.cooldown_error(wait)
         df, feedback_count, feature_cols, target_col = _training_frame()
         if len(df)<20 or df[target_col].nunique()<2:
             raise ValueError("有效训练数据不足：至少需要 20 条且同时包含正常和故障样本")
@@ -341,13 +439,7 @@ def rollback_model(payload):
 def training_history(limit=20):
     with _connect() as c:
         rows=c.execute("SELECT * FROM model_training_runs ORDER BY id DESC LIMIT ?",(int(limit),)).fetchall()
-    out=[]
-    for r in rows:
-        d=dict(r)
-        try:d["metrics"]=json.loads(d.pop("metrics_json") or "{}")
-        except Exception:d["metrics"]={}
-        out.append(d)
-    return out
+    return model_runs.with_metrics(rows)
 
 
 def summary():
@@ -355,8 +447,12 @@ def summary():
         total=c.execute("SELECT COUNT(*) FROM model_feedback_samples").fetchone()[0]
         reviewed=c.execute("SELECT COUNT(*) FROM model_feedback_samples WHERE status='reviewed'").fetchone()[0]
         trainable=c.execute("SELECT COUNT(*) FROM model_feedback_samples WHERE status='reviewed' AND feedback_label IN (0,1)").fetchone()[0]
+        labeled=c.execute("SELECT COUNT(*) FROM model_feedback_samples WHERE fault_type IS NOT NULL").fetchone()[0]
+        linked=c.execute("SELECT COUNT(*) FROM model_feedback_samples WHERE event_id IS NOT NULL").fetchone()[0]
     with _connect() as c:
         pending_approvals = c.execute("SELECT COUNT(*) FROM model_training_runs WHERE status='pending_approval'").fetchone()[0]
     return {"active_version":active_version(),"total_samples":total,"reviewed_samples":reviewed,
             "trainable_samples":trainable,"pending_samples":total-reviewed,
+            "labeled_types":labeled,"linked_events":linked,
+            "train_interval_seconds":model_runs.TRAIN_INTERVAL_SECONDS,
             "pending_approvals":pending_approvals,"history":training_history()}

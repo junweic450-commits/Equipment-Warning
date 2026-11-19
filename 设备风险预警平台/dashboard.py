@@ -66,7 +66,9 @@ import ai_analyze
 import ai_model
 import dataset_builder
 import equipment_db
+import health_models
 import model_learning
+import model_runs
 
 
 # --------------------------------------------------------------------------
@@ -462,6 +464,91 @@ def _level(prob):
     return {"name": "报警", "key": "red", "color": "#d63b2f"}
 
 
+def _model_sample(dev, row, cal):
+    """给模型的一行物理量：台账额定值 + 最新遥测，抽屉里手填的覆盖值优先。
+
+    风险等级、最可能故障、剩余寿命三处共用这一份取数口径，否则同一台设备会出现
+    三个数字各说各话。湿度/粉尘不在这里——工况项已经在 cond_risk 里算过一次。
+    """
+    def pick(field, ov_key):
+        value = cal.get(ov_key)
+        if value not in (None, ""):
+            return float(value)
+        return row.get(field)
+
+    sample = {
+        "type": dev["type"],
+        "rated_v": dev["rated_v"], "rated_i": dev["rated_i"], "rated_p": dev["rated_p"],
+        "env_temp": pick("env_temp", "ov_env_temp"),
+        "dev_temp": pick("dev_temp", "ov_dev_temp"),
+        "current": pick("current", "ov_current"),
+        "run_hours": row.get("run_hours"),
+        "since_repair_hours": row.get("since_repair_hours"),
+    }
+    # 可选传感器列现场有就带上；没有的列留给 health_models 按缺失值处理，不拿 0 顶。
+    for name in health_models.OPTIONAL_FEATURES:
+        if name in row:
+            sample[name] = row.get(name)
+    return sample
+
+
+_HEALTH_TRAIN_AT = {}
+
+
+def _health_train(payload):
+    """按种类训一轮故障分类 / 剩余寿命模型；门禁没过就把「还差什么」原样回出去，不装作成功。"""
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    kind = str(payload.get("kind") or "").strip()
+    if kind not in health_models.KINDS:
+        raise ValueError("模型种类只能是 %s" % "或".join(health_models.KIND_LABELS[k] for k in health_models.KINDS))
+    with _STORE_LOCK:
+        wait = model_runs.wait_left(_HEALTH_TRAIN_AT.get(kind))
+        if wait > 0:
+            raise model_runs.cooldown_error(wait)      # 与二分类风险模型同一规矩、同一句话
+        _HEALTH_TRAIN_AT[kind] = time.time()
+        res = health_models.train_fault_type() if kind == "fault_type" else health_models.train_rul()
+    res["kind"] = kind
+    res["passed"] = bool(res.get("ok"))
+    _audit("HEALTH TRAIN %s version=%s passed=%s" % (kind, res.get("version") or "-", res["passed"]))
+    return res
+
+
+def _health_publish(payload, rollback=False):
+    """候选模型上线 / 回滚：只有管理员点头，风险概览那两列才开始用这一版。"""
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    kind = str(payload.get("kind") or "").strip()
+    version = str(payload.get("version") or "").strip()
+    approver = str(payload.get("approver") or "").strip()[:80]
+    if kind not in health_models.KINDS:
+        raise ValueError("模型种类只能是 %s" % "或".join(health_models.KIND_LABELS[k] for k in health_models.KINDS))
+    res = health_models.rollback(kind, version, approver) if rollback \
+        else health_models.publish(kind, version, approver)
+    _audit("HEALTH %s %s %s by=%s" % ("ROLLBACK" if rollback else "PUBLISH",
+                                      kind, version, approver or "-"))
+    return res
+
+
+def _health_overview():
+    """风险概览那两列：每台设备最新一条 → 最可能故障 Top-3 + 剩余寿命 P10–P90。"""
+    devices = equipment_db.get_all_devices()
+    latest = _latest_telemetry()
+    samples = []
+    for dev in devices:
+        row = latest.get(dev["code"])
+        if not row:
+            continue
+        item = _model_sample(dev, row, _calib_of(dev["code"]))
+        item["code"] = dev["code"]
+        item["sim_time"] = row.get("sim_time")
+        samples.append(item)
+    out = health_models.overview(samples)
+    out["ok"] = True
+    out["samples"] = len(samples)
+    return out
+
+
 def _predict_all():
     """全设备预测：台账 × 最新遥测 × 工况校准 → 综合风险。返回 (列表, 模型可用)。"""
     devices = equipment_db.get_all_devices()
@@ -506,23 +593,7 @@ def _predict_all():
             out.append(item)
             continue
 
-        def pick(field, ov_key):
-            """优先用抽屉里手填的覆盖值，没填就用实测遥测。"""
-            value = cal.get(ov_key)
-            if value not in (None, ""):
-                return float(value)
-            return row.get(field)
-
-        # 只送 9 个物理量给模型；湿度/粉尘等工况项已经在 cond_risk 里计过一次
-        sample = {
-            "type": dev["type"],
-            "rated_v": dev["rated_v"], "rated_i": dev["rated_i"], "rated_p": dev["rated_p"],
-            "env_temp": pick("env_temp", "ov_env_temp"),
-            "dev_temp": pick("dev_temp", "ov_dev_temp"),
-            "current": pick("current", "ov_current"),
-            "run_hours": row.get("run_hours"),
-            "since_repair_hours": row.get("since_repair_hours"),
-        }
+        sample = _model_sample(dev, row, cal)
         manual = any(cal.get(k) not in (None, "")
                      for k in ("ov_env_temp", "ov_dev_temp", "ov_current"))
         item["source"] = "手动" if manual else "实测"
@@ -615,13 +686,6 @@ def _csv_pct(value):
     return "" if value is None else "%.2f%%" % (float(value) * 100)
 
 
-def _csv_cell(value):
-    """Excel/WPS 会把以 = + - @ 开头的单元格当公式执行。台账里的名称、备注是人工填的，
-       导出前给这几个开头的字段加一个前导单引号，按纯文本存，公式打不开。"""
-    text = "" if value is None else str(value)
-    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
-
-
 def _export_rows(kind, g):
     ts = g.get("ts") or "—"
     if kind == "devices":
@@ -640,7 +704,7 @@ def _export_rows(kind, g):
         head = ["处理窗口", "台数", "设备编号", "依据", "期限", "其中已到期", "分析时间"]
         body = [[p["window"], p["count"], "、".join(p["codes"]), p["reason"],
                  p["dates"], p["overdue"], ts] for p in g["plan"]]
-    return [head] + [[_csv_cell(cell) for cell in row] for row in body]
+    return [head] + [[equipment_db.csv_cell(cell) for cell in row] for row in body]
 
 
 def _export_filenames(kind, ts):
@@ -973,6 +1037,40 @@ IMPORT_ALIASES = {
 }
 
 
+# 故障事件 / 生命周期导入：各一份别名与必填列，读取和校验仍共用 _read_delimited。
+# 表头写法按现场常见叫法铺开收（"修复时间"和"恢复时间"是一回事），归一不到的一律算
+# 未识别列并在预检结果里点名，不静默丢列。
+EVENT_IMPORT = {
+    "fault_events": (
+        {"设备编号": "code", "编号": "code", "设备号": "code", "资产编号": "code", "code": "code",
+         "失效时间": "fail_time", "故障时间": "fail_time", "故障发生时间": "fail_time",
+         "发生时间": "fail_time", "失效日期": "fail_time", "故障日期": "fail_time",
+         "failtime": "fail_time", "failuretime": "fail_time",
+         "故障类型": "fault_type", "故障模式": "fault_type", "失效模式": "fault_type",
+         "类型": "fault_type", "faulttype": "fault_type",
+         "严重程度": "severity", "等级": "severity", "severity": "severity",
+         "处理措施": "action", "处理经过": "action", "检修内容": "action", "措施": "action",
+         "action": "action",
+         "恢复时间": "restore_time", "修复时间": "restore_time", "复归时间": "restore_time",
+         "restoretime": "restore_time",
+         "备注": "note", "说明": "note", "note": "note"},
+        {"code": "设备编号", "fail_time": "失效时间", "fault_type": "故障类型",
+         "severity": "严重程度", "action": "处理措施", "restore_time": "恢复时间",
+         "note": "备注"},
+        ("code", "fail_time", "fault_type"),
+    ),
+    "device_lifecycle": (
+        {"设备编号": "code", "编号": "code", "设备号": "code", "code": "code",
+         "事件时间": "event_time", "时间": "event_time", "发生时间": "event_time",
+         "日期": "event_time", "eventtime": "event_time",
+         "事件类型": "kind", "类型": "kind", "kind": "kind",
+         "备注": "note", "说明": "note", "note": "note"},
+        {"code": "设备编号", "event_time": "事件时间", "kind": "事件类型", "note": "备注"},
+        ("code", "event_time", "kind"),
+    ),
+}
+
+
 def _norm_header(raw):
     """表头归一：去 BOM、去括号里的单位、去掉所有空白和常见分隔符、转小写。
 
@@ -1002,13 +1100,13 @@ def _import_value(field, raw):
     return v
 
 
-def _read_device_csv(text, force_delim=None):
-    """CSV 文本 → ([(表格行号, {字段名: 原文})], 分隔符, 表头里没认出的列).
+def _read_delimited(text, aliases, header_labels, required, force_delim=None,
+                    cleaner=None, cell_guard=True):
+    """分隔符文本 → ([(表格行号, {字段名: 原文})], 分隔符, 表头里没认出的列)。
 
-    分隔符按表头行里出现次数最多的候选定，不用 csv.Sniffer：Sniffer 只看首行，
-    表头里恰好只有一个逗号时会从正文挑分号当分隔符，整份解析结果跟着错位。
-    force_delim 是给 Excel 那条路用的（_read_device_xlsx 把单元格摊成 Tab 文本再
-    从这里进来），分隔符已经定死，嗅探和引号闭合这两道保险就不必再判一遍。
+    台账、故障事件、生命周期三张表都从这里进：表头别名、必填列、超长单元格、行号
+    这套判定只有一份。CSV 与 .xlsx 也共用它（xlsx 先摊成 Tab 文本），所以同一份数据
+    换个格式导进来，预检结果必须逐字段一致。
     """
     if text.startswith("\ufeff"):
         text = text[1:]
@@ -1030,17 +1128,17 @@ def _read_device_csv(text, force_delim=None):
     rows = list(csv.reader(lines[head_idx:], delimiter=delim))
     fields, unknown = {}, []
     for i, cell in enumerate(rows[0]):
-        text = str(cell or "").strip()
-        key = IMPORT_ALIASES.get(_norm_header(cell))
+        cell_text = str(cell or "").strip()
+        key = aliases.get(_norm_header(cell))
         if key is None:
-            if text and text not in unknown:
-                unknown.append(text)
+            if cell_text and cell_text not in unknown:
+                unknown.append(cell_text)
         elif key in fields.values():
-            if text and text not in unknown:      # 同名列重复出现，后一列不覆盖前一列
-                unknown.append(text + "（重复列）")
+            if cell_text and cell_text not in unknown:   # 同名列重复出现，后一列不覆盖前一列
+                unknown.append(cell_text + "（重复列）")
         else:
             fields[i] = key
-    missing = [IMPORT_HEADER[k] for k in ("code", "name", "type") if k not in fields.values()]
+    missing = [header_labels[k] for k in required if k not in fields.values()]
     if missing:
         raise ValueError("表头里缺 %s 这几列。点「下载模板」照格式填，或把这些列改成上面的名字。"
                          % "、".join(missing))
@@ -1051,24 +1149,51 @@ def _read_device_csv(text, force_delim=None):
         for j, field in fields.items():
             if j >= len(cells):
                 continue
-            v = _import_value(field, cells[j])
-            if len(v) > IMPORT_MAX_CELL:
+            v = cleaner(field, cells[j])
+            if cell_guard and len(v) > IMPORT_MAX_CELL:
                 raise ValueError("第 %d 行的「%s」有 %d 个字，多半是整段说明挤进了一列；"
-                                 "这种行请在 Excel 里分列后再导" % (i, IMPORT_HEADER[field], len(v)))
+                                 "这种行请在 Excel 里分列后再导" % (i, header_labels[field], len(v)))
             rec[field] = v
         if any(rec.values()):                    # 空行、只有空格的行直接跳过不计数
             records.append((i, rec))
     return records, delim, unknown
 
 
-def _read_device_xlsx(data):
-    """Excel 2007+ 的 .xlsx 原文件 → 与 _read_device_csv 完全相同的三元组。
+def _import_event_value(field, raw):
+    """事件表的单元格清洗：只去首尾空白，时间原文必须整段留着。
 
-    这里只把单元格摊成 Tab 分隔文本，表头别名、必填列、超长单元格、行号这套校验
-    全部走 _read_device_csv 那一份代码：同一张表存成 .xlsx 和存成 .csv 导进来必须
-    得到一模一样的预检结果，两套解析逻辑各自演化迟早漂开。
-    日期单元格 openpyxl 给的就是 datetime，str() 之后正好被 _import_value 按空格
-    截成 YYYY-MM-DD，不必自己按 1900/1904 纪元换算 Excel 的序列号。
+    台账那条 _import_value 会把投运日期按空格截成 YYYY-MM-DD；失效时间要是也这么截，
+    「2026-08-03 09:20」的时刻就没了，RUL 标签会凭空多出最多 24 小时误差。
+    """
+    return str(raw or "").strip()
+
+
+def _read_device_csv(text, force_delim=None):
+    """台账 CSV 文本 → ([(表格行号, {字段名: 原文})], 分隔符, 表头里没认出的列).
+
+    分隔符按表头行里出现次数最多的候选定，不用 csv.Sniffer：Sniffer 只看首行，
+    表头里恰好只有一个逗号时会从正文挑分号当分隔符，整份解析结果跟着错位。
+    force_delim 是给 Excel 那条路用的（_read_device_xlsx 把单元格摊成 Tab 文本再
+    从这里进来），分隔符已经定死，嗅探和引号闭合这两道保险就不必再判一遍。
+    """
+    return _read_delimited(text, IMPORT_ALIASES, IMPORT_HEADER, ("code", "name", "type"),
+                           force_delim, _import_value)
+
+
+def _read_event_csv(table, text, force_delim=None):
+    """故障事件 / 生命周期 CSV：与台账共用 _read_delimited，只换别名和必填列。"""
+    aliases, labels, required = EVENT_IMPORT[table]
+    return _read_delimited(text, aliases, labels, required, force_delim,
+                           _import_event_value)
+
+
+def _xlsx_to_tsv(data):
+    """xlsx 原文件 → Tab 分隔文本 + 「读的是哪张表」的说明。
+
+    这里只负责摊平，表头别名、必填列、超长单元格、行号全部交给 _read_delimited 那一份
+    代码：同一张表存成 .xlsx 和存成 .csv 导进来必须得到一模一样的预检结果，两套解析
+    逻辑各自演化迟早漂开。
+    日期单元格 openpyxl 给的就是 datetime，str() 之后带空格，正好被时间归一接住。
     """
     try:
         from openpyxl import load_workbook
@@ -1094,7 +1219,7 @@ def _read_device_xlsx(data):
         for row in sheet.iter_rows(values_only=True):
             cells += len(row)
             if cells > IMPORT_MAX_XLSX_CELLS:
-                raise ValueError("这份 Excel 摊开有 %d 个格子，超过导入上限 %d 个（台账通常只有十几列）。"
+                raise ValueError("这份 Excel 摊开有 %d 个格子，超过导入上限 %d 个（这类表通常只有十几列）。"
                                  "请确认导的是台账本身，不是带格式的大空表；"
                                  "若表里确实有这么多列，请删掉无关列另存一份再导"
                                  % (cells, IMPORT_MAX_XLSX_CELLS))
@@ -1109,13 +1234,26 @@ def _read_device_xlsx(data):
         title = sheet.title
     finally:
         wb.close()                                 # read_only 的 workbook 底下是个没关的 zip
-    records, _, unknown = _read_device_csv(buf.getvalue(), "\t")
     # 只读第一张是明说的规矩（多张表的口径一旦各读一张，台账就分不清哪份是准的），
     # 但读的是哪张、这份一共几张得写在结果上：改了第三张表却导不进来的时候，
     # 班组靠这句提示才知道要把它挪到第一张。
     label = "Excel 工作表「%s」" % title
     if sheets > 1:
         label += "（这份共 %d 张表，只读第一张）" % sheets
+    return buf.getvalue(), label
+
+
+def _read_device_xlsx(data):
+    """Excel 2007+ 的 .xlsx 原文件 → 与 _read_device_csv 完全相同的三元组。"""
+    tsv, label = _xlsx_to_tsv(data)
+    records, _, unknown = _read_device_csv(tsv, "\t")
+    return records, label, unknown
+
+
+def _read_event_xlsx(table, data):
+    """事件表的 xlsx 入口：摊平那一步和台账共用，校验也共用。"""
+    tsv, label = _xlsx_to_tsv(data)
+    records, _, unknown = _read_event_csv(table, tsv, "\t")
     return records, label, unknown
 
 
@@ -1262,6 +1400,173 @@ def _import_template_rows():
     return rows
 
 
+# --------------------------------------------------------------------------
+# 故障事件 / 生命周期：录入、列表、编辑、导入、删除
+# 两张表共用下面这一组函数，差别全部收在 equipment_db.EVENT_TABLES 那份字段闸里，
+# 免得「故障事件改了校验、生命周期没改」这种漂移。
+# --------------------------------------------------------------------------
+def _event_fields(table):
+    return equipment_db.EVENT_TABLES[table]["fields"]
+
+
+def _event_form(table, payload):
+    """只挑这张表认识的字段入库，其余键忽略。"""
+    payload = payload if isinstance(payload, dict) else {}
+    return {name: payload.get(name) for name, _label, _req, _lim in _event_fields(table)}
+
+
+def _list_events(table, query):
+    code = (query.get("code", [""])[0] or "").strip()
+    status = (query.get("status", [""])[0] or "").strip()
+    if table != "fault_events":
+        status = ""                       # 生命周期表没有待确认状态，筛选条件不硬塞给它
+    if status and status not in ("confirmed", "pending"):
+        raise ValueError("状态筛选只支持已确认或待确认")
+    return {"ok": True,
+            "events": equipment_db.search_event_records(
+                table, code or None, status or None, limit=500),
+            "counts": equipment_db.event_counts(table),
+            "options": {"fault_type": equipment_db.FAULT_TYPES,
+                        "severity": equipment_db.FAULT_SEVERITY,
+                        "kind": equipment_db.LIFECYCLE_KINDS},
+            # 空状态那句「还差多少条」要说得出口径，阈值只留在训练模块里，这里原样递出去
+            "limits": {"fault_min_events": health_models.FAULT_MIN_SAMPLES,
+                       "rul_min_failures": health_models.RUL_MIN_FAILURES}}
+
+
+def _save_event(table, payload):
+    """单条录入。重复（同设备同时间）直接报错，不静默跳过——现场要的是确定写进去了。"""
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    record = _event_form(table, payload)
+    reviewer = str(payload.get("reviewer") or "").strip()[:80]
+    res = equipment_db.add_event_records(table, [record], source="manual", reviewer=reviewer)
+    if not res["added"]:
+        raise ValueError(res["skipped"][0]["reason"] if res["skipped"] else "写入失败")
+    _audit("EVENT ADD %s code=%s" % (table, record.get("code") or "-"))
+    return {"ok": True, "id": res["ids"][0], "counts": equipment_db.event_counts(table)}
+
+
+def _update_event(table, payload):
+    """人工修正一条已入库事件：整条重发，走同一个字段闸。"""
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    try:
+        record_id = int(payload.get("id"))
+    except (TypeError, ValueError):
+        raise ValueError("缺少记录编号")
+    if not equipment_db.update_event_record(
+            table, record_id, _event_form(table, payload),
+            reviewer=str(payload.get("reviewer") or "").strip()[:80]):
+        raise ValueError("记录不存在，或没有需要更新的内容")
+    _audit("EVENT UPDATE %s id=%d" % (table, record_id))
+    return {"ok": True, "counts": equipment_db.event_counts(table)}
+
+
+def _delete_event(table, payload):
+    if not isinstance(payload, dict):
+        raise ValueError("请求体结构非法")
+    try:
+        record_id = int(payload.get("id"))
+    except (TypeError, ValueError):
+        raise ValueError("缺少记录编号")
+    if not equipment_db.delete_event_record(table, record_id):
+        raise ValueError("记录不存在或已被删除")
+    _audit("EVENT DELETE %s id=%d" % (table, record_id))
+    return {"ok": True, "counts": equipment_db.event_counts(table)}
+
+
+def _import_events(table, payload):
+    """事件批量导入（CSV 文本 / .xlsx 原文件）。dry_run=True 只做预检不落库。
+
+    和台账导入的区别：这里没有「覆盖」模式。已确认过的失效时刻再导一遍，
+    只会把同一条事件改成另一份说法，标签就再也分不清哪次是准的，所以一律跳过。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    dry = bool(payload.get("dry_run"))
+    b64 = payload.get("xlsx_b64")
+    if b64 is not None:
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            raise ValueError("Excel 文件没读全，请重新选择文件后再导一次")
+        records, source_label, unknown = _read_event_xlsx(table, raw)
+    else:
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("请先选择要导入的 CSV 文件")
+        records, _delim, unknown = _read_event_csv(table, text)
+        source_label = "CSV 文本"
+    if not records:
+        raise ValueError("表头以下没有可导入的数据行")
+    if len(records) > IMPORT_MAX_ROWS:
+        raise _row_cap_error(len(records))
+
+    known = {d["code"] for d in equipment_db.get_all_devices()}
+    dup_keys = equipment_db.EVENT_TABLES[table]["dup_keys"]
+    existing = {tuple(str(r.get(k) or "") for k in dup_keys)
+                for r in equipment_db.search_event_records(table, limit=5000)}
+    staged, errors, seen = [], [], {}
+    skipped = 0
+    for line_no, rec in records:
+        code = str(rec.get("code") or "")
+        try:
+            values = equipment_db.clean_event_record(table, rec)
+        except ValueError as exc:
+            errors.append({"line": line_no, "code": code or "—", "reason": str(exc)})
+            continue
+        if values["code"] not in known:
+            errors.append({"line": line_no, "code": values["code"],
+                           "reason": "台账里没有这个编号，请先把它录进台账"})
+            continue
+        key = tuple(str(values[k] or "") for k in dup_keys)
+        if key in seen:
+            errors.append({"line": line_no, "code": values["code"],
+                           "reason": "这份文件里同一条事件出现两次（第 %d 行已经出现过）" % seen[key]})
+            continue
+        seen[key] = line_no
+        if key in existing:
+            skipped += 1
+            continue
+        staged.append((line_no, values))
+
+    written, dup_now = 0, 0
+    if not dry and staged:
+        res = equipment_db.add_event_records(
+            table, [v for _, v in staged], source="import",
+            reviewer=str(payload.get("reviewer") or "")[:80])
+        written, dup_now = res["added"], len(res["skipped"])
+    if not dry:
+        _audit("EVENT IMPORT %s added=%d skipped=%d failed=%d total=%d"
+               % (table, written, dup_now + skipped, len(errors), len(records)))
+    return {"ok": True, "dry_run": dry, "table": table, "total": len(records),
+            "added": written if not dry else len(staged),
+            "skipped": skipped + dup_now, "failed": len(errors),
+            "errors": errors[:IMPORT_ERROR_SHOWN],
+            "errors_hidden": max(0, len(errors) - IMPORT_ERROR_SHOWN),
+            "unknown": unknown[:20], "source": source_label,
+            "counts": equipment_db.event_counts(table),
+            "max_rows": IMPORT_MAX_ROWS}
+
+
+def _event_template_rows(table):
+    """事件导入模板：表头 + 两行示例，示例编号用台账里真实存在的设备，避免照抄导不进。"""
+    labels = EVENT_IMPORT[table][1]
+    rows = [list(labels.values())]
+    codes = [d["code"] for d in equipment_db.get_all_devices()] or ["PU-001"]
+    if table == "fault_events":
+        rows.append([codes[0], "2026-08-03 09:20", equipment_db.FAULT_TYPES[5], "中等",
+                     "更换机械密封", "2026-08-03 14:00", "示例行，导入前请删掉或改成真实记录"])
+        rows.append([codes[-1], "2026-08-11", equipment_db.FAULT_TYPES[3], "严重",
+                     "", "", "只填日期也可以，但建议填到时刻（RUL 按小时算）"])
+    else:
+        rows.append([codes[0], "2026-10-01 08:00", "计划检修",
+                     "示例行：按计划到点更换不算故障失效，导进来是为了把它从 RUL 标签里摘出去"])
+        rows.append([codes[-1], "2026-08-03 14:00", "故障停机", "示例行，导入前请删掉或改成真实记录"])
+    return rows
+
+
 def _delete_device(payload):
     """删台账，同时清掉它的遥测和校准。"""
     if not isinstance(payload, dict):
@@ -1374,6 +1679,7 @@ PAGES = {
     "/report.html": ("report.html", "text/html; charset=utf-8"),
     "/assets/report.js": ("assets/report.js", "application/javascript; charset=utf-8"),
     "/assets/model-center.js": ("assets/model-center.js", "application/javascript; charset=utf-8"),
+    "/assets/events.js": ("assets/events.js", "application/javascript; charset=utf-8"),
     "/assets/app.css": ("assets/app.css", "text/css; charset=utf-8"),
     "/assets/common.js": ("assets/common.js", "application/javascript; charset=utf-8"),
     "/assets/analysis.js": ("assets/analysis.js", "application/javascript; charset=utf-8"),
@@ -1395,6 +1701,20 @@ def _page_html(route):
     if text is None:
         return "<!DOCTYPE html><meta charset='utf-8'><title>缺少 %s</title>" % rel
     return text
+
+
+# 事件类路由 → 数据层表名。两条业务线（故障事件 / 生命周期）共用一组处理函数，
+# 路由分开放在这里而不是塞进 payload 里，是为了让 CSRF 与 Host 那套探针能逐条枚举。
+EVENT_SAVE_ROUTES = {"/api/fault-events": "fault_events", "/api/lifecycle": "device_lifecycle"}
+EVENT_UPDATE_ROUTES = {"/api/fault-events/update": "fault_events",
+                       "/api/lifecycle/update": "device_lifecycle"}
+EVENT_DELETE_ROUTES = {"/api/fault-events/delete": "fault_events",
+                       "/api/lifecycle/delete": "device_lifecycle"}
+EVENT_IMPORT_ROUTES = {"/api/fault-events/import": "fault_events",
+                       "/api/lifecycle/import": "device_lifecycle"}
+EVENT_GET_ROUTES = {"/api/fault-events": "fault_events", "/api/lifecycle": "device_lifecycle"}
+EVENT_TEMPLATE_ROUTES = {"/api/fault-events/template.csv": ("fault_events", "fault_events_template.csv", "故障事件导入模板.csv"),
+                         "/api/lifecycle/template.csv": ("device_lifecycle", "device_lifecycle_template.csv", "设备生命周期导入模板.csv")}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1524,6 +1844,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_state())
             except Exception as exc:
                 self._fail(exc)
+        elif path == "/api/health-models":
+            try:
+                self._send_json(_health_overview())
+            except Exception as exc:
+                self._fail(exc)
         elif path == "/api/analysis":
             try:
                 code = parse_qs(parsed.query).get("code", [""])[0]
@@ -1562,7 +1887,9 @@ class Handler(BaseHTTPRequestHandler):
                 _predict_all()
                 status = parse_qs(parsed.query).get("status", ["all"])[0]
                 self._send_json({"ok": True, "summary": model_learning.summary(),
-                                 "data": model_learning.list_samples(status=status, limit=500)})
+                                 "health": health_models.summary(),
+                                 "data": model_learning.list_samples(status=status, limit=500),
+                                 "options": {"fault_type": list(equipment_db.FAULT_TYPES)}})
             except Exception as exc:
                 self._fail(exc)
         elif path == "/api/daily-report":
@@ -1578,6 +1905,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "records": equipment_db.search_work_records(
                     keyword=q.get("keyword", [""])[0], field=q.get("field", [""])[0],
                     value=q.get("value", [""])[0], limit=5000)})
+            except Exception as exc:
+                self._fail(exc)
+        elif path in EVENT_GET_ROUTES:
+            try:
+                self._send_json(_list_events(EVENT_GET_ROUTES[path], parse_qs(parsed.query)))
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, 400)
+            except Exception as exc:
+                self._fail(exc)
+        elif path in EVENT_TEMPLATE_ROUTES:
+            try:
+                table, ascii_name, utf8_name = EVENT_TEMPLATE_ROUTES[path]
+                self._send_csv(_event_template_rows(table), ascii_name, utf8_name)
             except Exception as exc:
                 self._fail(exc)
         else:
@@ -1653,6 +1993,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(model_learning.publish_candidate(payload))
             elif path == "/api/model-rollback":
                 self._send_json(model_learning.rollback_model(payload))
+            elif path == "/api/health-model-train":
+                self._send_json(_health_train(payload))
+            elif path == "/api/health-model-publish":
+                self._send_json(_health_publish(payload, rollback=False))
+            elif path == "/api/health-model-rollback":
+                self._send_json(_health_publish(payload, rollback=True))
             elif path == "/api/work-log/parse":
                 self._send_json(_parse_work_log(payload))
             elif path == "/api/work-records/confirm":
@@ -1677,6 +2023,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(_save_calibration(payload))
             elif path == "/api/calibration/reset":
                 self._send_json(_reset_calibration(payload))
+            elif path in EVENT_SAVE_ROUTES:
+                self._send_json(_save_event(EVENT_SAVE_ROUTES[path], payload))
+            elif path in EVENT_UPDATE_ROUTES:
+                self._send_json(_update_event(EVENT_UPDATE_ROUTES[path], payload))
+            elif path in EVENT_DELETE_ROUTES:
+                self._send_json(_delete_event(EVENT_DELETE_ROUTES[path], payload))
+            elif path in EVENT_IMPORT_ROUTES:
+                self._send_json(_import_events(EVENT_IMPORT_ROUTES[path], payload))
             else:
                 self.send_error(404)
         except ValueError as exc:

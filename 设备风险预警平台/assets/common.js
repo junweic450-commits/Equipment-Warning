@@ -18,6 +18,11 @@ const S = {
   imp: {text: "", name: "", summary: null, canApply: false, phase: "idle"},
 };
 
+/* 「最可能故障」「剩余寿命」这两列的临时状态。
+   它走单独的 /api/health-models：线上模型没发布时后端只回原因，
+   风险色档照旧画满，两件事互不拖累。 */
+const H = {data: null, error: "", loading: false};
+
 /* 所有写进 innerHTML 的服务端数据都要过这里，防止台账/巷道名里带标签造成 XSS */
 const ESC_MAP = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
 function esc(v){
@@ -81,6 +86,7 @@ async function load(){
     S.state = await r.json();
     render();
     S.hooks.onState.forEach(fn => { try{ fn(S.state); }catch(e){ console.error(e); } });
+    loadHealth();                       // 两列新数据异步补上，不拖慢首屏
   }catch(e){
     if (has("ts")) byId("ts").textContent = "无法连接服务：" + e.message;
   }
@@ -96,6 +102,7 @@ function render(){
   renderLegend();
   renderCards();
   renderTable();
+  renderHealthNote();
   renderFormOptions(s);
   if (S.cfg.env) renderEnv(s);
   // 智能分析面板归 analysis.js 自己画，但它那台「一台一台看」的分页也走这里那套
@@ -127,6 +134,117 @@ function renderLegend(){
   ).join("");
 }
 
+/* ---------------------------------------------------------- 最可能故障 / 剩余寿命 */
+/* 这两列的取数口径和风险等级是同一份（服务端 _model_sample），所以三处说的是同一时刻的事。
+   线上模型没发布时单元格只画「—」，具体差什么写在表格上方那一行，不在每台设备上重复刷屏。 */
+const HM_LABEL = {fault_type: "「最可能故障」", rul: "「剩余寿命」"};
+
+async function loadHealth(){
+  if (!has("tableWrap") && !has("cards")) return;   // 没有这两列的页面不白跑一次推理
+  if (H.loading) return;                            // 15 秒轮询撞上手动刷新时，只留一个在飞
+  H.loading = true;
+  try{
+    const r = await fetch("/api/health-models", {cache: "no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    H.data = await r.json();
+    H.error = "";
+  }catch(e){
+    H.data = null;
+    H.error = e.message;
+  }
+  H.loading = false;
+  renderHealthNote();
+  if (!S.state) return;                 // 台账都没拉到，卡片和表格本来就没画，不必补这两列
+  renderCards();
+  renderTable();
+}
+
+function healthOf(code){
+  const list = (H.data && H.data.devices) || [];
+  return list.find(x => x.code === code) || null;
+}
+
+/* 概率给整数百分比就够了：小数点后那位在两台设备之间根本比不出先后 */
+function top3HTML(top3){
+  if (!top3 || !top3.length) return '<span class="hm-none">—</span>';
+  return `<div class="hm-chips">` + top3.map(t =>
+    `<span class="hm-chip${t.is_normal ? " hm-ok" : ""}">${esc(t.fault_type)} ${(t.probability * 100).toFixed(0)}%</span>`
+  ).join("") + `</div>`;
+}
+
+/* 小时数是天与时的分水岭：现场排检修看的是「还能跑几天」，不到一天就照小时说。
+   一格之内单位必须一致，不能 P50 说天、P90 说小时。 */
+function rulParts(r){
+  if (!r || r.p50 === null || r.p50 === undefined) return null;
+  const days = Number(r.p50) >= 720;
+  const f = v => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "—";
+    return days ? (n / 24).toFixed(n / 24 >= 10 ? 0 : 1) + " 天" : Math.round(n) + " h";
+  };
+  return {main: f(r.p50), band: "P10–P90 " + f(r.p10) + "–" + f(r.p90)};
+}
+
+function rulCellHTML(r){
+  const p = rulParts(r);
+  if (!p) return '<span class="hm-none">—</span>';
+  return `<b>${p.main}</b><div class="hm-band">${p.band}</div>`;
+}
+
+function healthCells(code){
+  const x = healthOf(code);
+  return `<td class="hm-td">${top3HTML(x && x.top3)}</td><td class="hm-td">${rulCellHTML(x && x.rul)}</td>`;
+}
+
+function healthNoteText(){
+  if (H.error) return "这两列暂时取不到数：" + H.error + "。风险分级不受影响，照常计算。";
+  const n = H.data && H.data.notes;
+  if (!n) return "正在算这两列…";
+  const parts = [];
+  Object.keys(HM_LABEL).forEach(kind => {
+    const info = n[kind] || {};
+    if (info.live){
+      parts.push(HM_LABEL[kind] + "按线上版本 " + info.live + " 计算");
+      return;
+    }
+    const gaps = (info.gaps || []).slice(0, 2).join("；");
+    parts.push(HM_LABEL[kind] + "暂时空着：" + info.reason + (gaps ? "　→ " + gaps : ""));
+  });
+  const miss = [];
+  const mf = H.data.missing_features || {};
+  Object.keys(mf).forEach(k => (mf[k] || []).forEach(f => { if (miss.indexOf(f) < 0) miss.push(f); }));
+  if (miss.length) parts.push("这几列现场还没测到：" + miss.join("、") + "，模型按缺失值处理");
+  return parts.join("　|　");
+}
+
+/* 页头那句「这两列与风险各算各的」原本在首页、设备台账、训练中心各写一遍，
+   口径只留这一份：页面里放 <span data-hm-note></span>，启动时把字填进去。 */
+const HM_SCOPE_NOTE = "「最可能故障」和「剩余寿命」这两项来自另外两个模型，和「风险」那一列各算各的："
+  + "风险说的是这一时刻该不该管，这两项说的是大概坏成什么样、还能撑多久，不要把两者凑成一个数。"
+  + "没上线时先空着，页面会写清还差什么，补数据在「模型训练中心」。";
+
+function fillHmNotes(){
+  document.querySelectorAll("[data-hm-note]").forEach(el => { el.textContent = HM_SCOPE_NOTE; });
+}
+
+function renderHealthNote(){
+  if (!has("hmNote")) return;
+  const box = byId("hmNote");
+  const txt = healthNoteText();
+  box.textContent = txt;
+  box.className = "hm-note" + (H.error ? " bad" : "");
+}
+
+function healthCardHTML(code){
+  const x = healthOf(code);
+  if (!x) return "";
+  const p = rulParts(x.rul);
+  if (!x.top3 && !p) return "";
+  return `<div class="hm-card">${top3HTML(x.top3)}` +
+    (p ? `<div class="hm-rul">剩余寿命 <b>${p.main}</b>　${p.band}</div>`
+       : `<div class="hm-rul hm-none">剩余寿命 —</div>`) + `</div>`;
+}
+
 /* ---------------------------------------------------------------- 设备卡片 */
 function cardHTML(d){
   const t = d.telemetry || {};
@@ -146,6 +264,7 @@ function cardHTML(d){
       <div><i>累计运行</i><br>${fmt(t.run_hours, 0, "h")}</div>
       <div><i>距上次检修</i><br>${fmt(t.since_repair_hours, 0, "h")}</div>
     </div>
+    ${healthCardHTML(d.code)}
     ${d.error ? `<p class="hint" style="color:#a8322a">预测失败：${esc(d.error)}</p>` : ""}
     ${t.sim_time ? `<p class="hint">最新数据：${esc(t.sim_time)}</p>` : `<p class="hint">暂无运行记录，这台只按现场情况评级</p>`}
     <button class="ai-btn" data-act="ai" data-code="${esc(d.code)}">AI 解读</button>
@@ -291,7 +410,7 @@ function renderTable(){
   const full = !!S.cfg.fullTable;
   const head = ["编号", "名称", "类型", "巷道", "额定电压", "额定电流"]
     .concat(full ? ["额定功率", "状态", "投运日期", "厂家"] : ["状态"])
-    .concat(["风险", "操作"]);
+    .concat(["风险", "最可能故障", "剩余寿命", "操作"]);
   byId("tableWrap").innerHTML = `<div class="table-scroll"><table>
     <tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>
     ${pg.rows.map(d => `<tr>
@@ -300,6 +419,7 @@ function renderTable(){
       ${full ? `<td>${fmt(d.rated_p, 0, "kW")}</td><td>${esc(d.status)}</td>
                <td>${esc(d.commission_date || "-")}</td><td>${esc(d.maker || "-")}</td>` : ""}
       <td style="color:${esc(d.level.color)};font-weight:700">${esc(d.level.name)}</td>
+      ${healthCells(d.code)}
       <td>
         <button class="btn ghost small" data-act="edit" data-code="${esc(d.code)}">编辑</button>
         <button class="btn small" data-act="calib" data-code="${esc(d.code)}">校准</button>
@@ -986,6 +1106,7 @@ function boot(cfg){
   S.pager.table.size = S.cfg.rowPage || 0;
   injectChrome();
   injectNav();
+  fillHmNotes();
   const here = location.pathname.replace(/\.html$/, "") || "/";
   document.querySelectorAll(".nav a").forEach(a => {
     const href = a.getAttribute("href").replace(/\.html$/, "");

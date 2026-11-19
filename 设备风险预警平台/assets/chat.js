@@ -443,9 +443,9 @@ function greet(){
 
 /* 头部那行小字 + 智能分析面板的状态灯一起刷新：欠费 / 限流只有真调过才知道 */
 async function refreshChip(){
+  let s = null;
   try{
-    const r = await fetch("/api/agent/status", {cache: "no-store"});
-    const s = await r.json();
+    s = await App.api("/api/agent/status");
     const el = byId("qaModel");
     if (el){
       el.textContent = !s.ready ? "· 未就绪"
@@ -456,7 +456,8 @@ async function refreshChip(){
         + "。本地智能分析（风险解读与可行方案）不受影响。");
     }
   }catch(e){ /* 状态接口不可用时保持静默 */ }
-  if (window.SmartAnalysis && SmartAnalysis.refreshAgentStatus) SmartAnalysis.refreshAgentStatus();
+  /* 状态灯共用这一份结果；以前是这里取一遍、分析面板再取一遍，一次刷新打两次接口 */
+  if (window.SmartAnalysis) SmartAnalysis.applyAgentStatus(s);
 }
 
 window.QA = Object.assign(QA, {
