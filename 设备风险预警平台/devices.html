@@ -21,6 +21,13 @@
 <!-- 顶部页签由 common.js 统一注入 -->
 
 <main>
+  <div class="tabs" role="tablist" aria-label="设备台账分区">
+    <button class="tab-btn" type="button" role="tab" data-tab="info" aria-controls="tab-info" aria-selected="true" tabindex="0">设备信息</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="worklog" aria-controls="tab-worklog" aria-selected="false" tabindex="-1">维护日志</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="events" aria-controls="tab-events" aria-selected="false" tabindex="-1">故障事件与生命周期</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="env" aria-controls="tab-env" aria-selected="false" tabindex="-1">环境基准</button>
+  </div>
+  <div class="tab-panel" id="tab-info" role="tabpanel">
   <section class="sec">
     <div class="sec-hd">
       <div class="sec-title">设备信息维护</div>
@@ -53,7 +60,9 @@
     <div class="hm-note" id="hmNote"></div>
     <div id="tableWrap"></div>
     <div id="tablePager"></div>
-
+  </section>
+  </div>
+  <div class="tab-panel" id="tab-worklog" role="tabpanel" hidden>
     <div class="maintenance-panel" id="workLogSection">
     <div class="sec-hd">
       <div class="sec-title">设备维护信息</div>
@@ -87,36 +96,61 @@
       <button class="btn ghost small" type="button" onclick="resetWorkSearch()">重置</button>
     </div>
     <div id="workRecordList"><div class="empty">加载中…</div></div>
+    <div id="workRecordPager"></div>
     </div>
-  </section>
+  </div>
 
-  <section class="sec">
-    <div class="sec-hd">
-      <div class="sec-title">巷道工作环境</div>
-      <div class="sec-acts">
-        <button class="btn ghost small" onclick="saveDefaultEnv()">保存默认温度</button>
+  <div class="tab-panel" id="tab-events" role="tabpanel" hidden>
+    <!-- 原 model-center.html:8「训练数据：故障事件与设备生命周期」整段搬进来（搬家不是复制：
+         训练中心那一份同步删除），容器 evHead / evCounts / evForm / evPreview / evList
+         与 Task 2 的 evPager 一行跟着走。深链落点：/devices#tab=events。 -->
+    <section class="sec">
+      <div class="sec-hd">
+        <div class="sec-title">训练数据：故障事件与设备生命周期</div>
+        <div class="sec-acts" id="evHead"></div>
       </div>
-    </div>
-    <div class="tip">这里的基准温度只用于「智能分析」里环境严酷度的判断和说法，
-      看板分级用的环境温度取自历史运行记录，改这个值不会让分级跟着变。
-      只想临时调某台设备的工况，用台账行里的「校准」（那部分写进数据库，不动这个配置）。</div>
-    <div class="row2">
-      <div>
-        <label>巷道 → 环境基准温度（℃），保存后写入 sim_config.json</label>
-        <div id="envList"></div>
-        <div class="env-row" style="margin-top:10px">
-          <input id="newTunnel" placeholder="新巷道名称" style="flex:1 1 140px;max-width:200px" />
-          <input id="newTunnelTemp" type="number" step="0.5" value="23" style="max-width:110px" />
-          <button class="btn small" onclick="addTunnel()">添加</button>
+      <div class="tip">「故障事件」记下哪台设备、什么时候、坏成什么类型，是故障分类唯一的真值来源；「设备生命周期」把投运、计划检修、更换复位记下来，用来把这些停机从剩余寿命标签里摘出去。批量导入先预检再写入，同一设备同一时刻的重复记录会被跳过，不会把一次故障算成两次。</div>
+      <div id="evCounts" style="margin-bottom:10px"></div>
+      <div class="sample">
+        <div class="sample-hd"><b id="evFormTitle">录一条新的</b></div>
+        <div id="evForm"></div>
+      </div>
+      <div id="evPreview"><div class="hint">选了文件先「预检」：预检只会告诉你能进几条、哪几行有问题，一条都不写库。</div></div>
+      <div class="sub-title" style="margin-top:12px">已入库记录</div>
+      <div id="evList"><div class="empty">正在加载…</div></div>
+      <div id="evPager"></div>
+    </section>
+  </div>
+  <div class="tab-panel" id="tab-env" role="tabpanel" hidden>
+    <!-- 原 devices.html:93-119「巷道工作环境」整段包进面板，深链落点：/devices#tab=env。 -->
+    <section class="sec">
+      <div class="sec-hd">
+        <div class="sec-title">巷道工作环境</div>
+        <div class="sec-acts">
+          <button class="btn ghost small" onclick="saveDefaultEnv()">保存默认温度</button>
         </div>
       </div>
-      <div>
-        <label>默认环境温度（未匹配巷道时使用）</label>
-        <input id="defaultEnv" type="number" step="0.5" value="23" style="max-width:140px" />
-        <p class="hint" id="cfgHint"></p>
+      <div class="tip">这里的基准温度只用于「智能分析」里环境严酷度的判断和说法，
+        看板分级用的环境温度取自历史运行记录，改这个值不会让分级跟着变。
+        只想临时调某台设备的工况，用台账行里的「校准」（那部分写进数据库，不动这个配置）。</div>
+      <div class="row2">
+        <div>
+          <label>巷道 → 环境基准温度（℃），保存后写入 sim_config.json</label>
+          <div id="envList"></div>
+          <div class="env-row" style="margin-top:10px">
+            <input id="newTunnel" placeholder="新巷道名称" style="flex:1 1 140px;max-width:200px" />
+            <input id="newTunnelTemp" type="number" step="0.5" value="23" style="max-width:110px" />
+            <button class="btn small" onclick="addTunnel()">添加</button>
+          </div>
+        </div>
+        <div>
+          <label>默认环境温度（未匹配巷道时使用）</label>
+          <input id="defaultEnv" type="number" step="0.5" value="23" style="max-width:140px" />
+          <p class="hint" id="cfgHint"></p>
+        </div>
       </div>
-    </div>
-  </section>
+    </section>
+  </div>
 </main>
 
 <footer>本页只做展示与录入，不训练模型　|　台账数据仅存于本机 data/equipment.db</footer>
@@ -125,5 +159,10 @@
 <script src="/assets/analysis.js"></script>
 <script src="/assets/chat.js"></script>
 <script src="/assets/page-devices.js"></script>
+<!-- CF-3 脚本顺序硬约束：events.js 只定义 EV，boot() 的幂等闸门在 page-devices.js 里跑，
+     EV.mount() 必须排在它之后（表单的「设备编号」下拉与筛选器要读 App.state().devices，
+     排前面会在数据到手前渲染成自由输入框）；这一段整体照搬 model-center.html 原顺序。 -->
+<script src="/assets/events.js"></script>
+<script>EV.mount();</script>
 </body>
 </html>

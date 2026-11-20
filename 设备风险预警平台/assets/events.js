@@ -26,6 +26,8 @@ const EV = {
   setTable(t){
     this.table = t === "lifecycle" ? "device_lifecycle" : "fault_events";
     this.editingId = 0; this.preview = null; this.fileName = "";
+    App.pagerState("events").page = 1;   // 换表就是换了一批行，停在第 3 页看着像少了几条
+                                         // （refresh 入口不再复位，这一行是「换表」唯一的复位点）
     this.renderForm();
     this.refresh();
   },
@@ -72,7 +74,25 @@ const EV = {
     }
     set("note", r.note);
     App.byId("evFormTitle").textContent = "改这条 · #" + r.id + "（" + r.code + "）";
-    App.byId("tableWrap") && App.byId("evForm").scrollIntoView({block: "nearest"});
+    /* Task 3 搬家改的滚动目标：原来那句写作 App.byId("tableWrap") && …，条件表达的是
+       「台账表与表单同屏」——那是事件分区还住在 /model-center 时的旧世界。搬到
+       /devices 之后 #tableWrap 与表单同页但分处两个面板（它藏在「设备信息」签里、
+       被 hidden），这个判断恒为真，什么也拦不住，只是把「同屏」这个已经不存在的前提
+       留在代码里误导读者；反过来哪一页只挂 EV 不挂台账表，滚动就会被静默跳过。
+       所以条件删掉，滚到表单自己这里就是要点题的行为。 */
+    App.byId("evForm").scrollIntoView({block: "nearest"});
+  },
+
+  /* 筛选变更点：#evFilterCode / #evFilterStatus 的 onchange 只走这里。
+     换了条件就是换了一批行，页码必须跟着回第一页——paginate 只把越界的页码收到
+     最后一页，人停在第 3 页看到的是筛剩那一撮的尾巴。写法照 common.js 的
+     bindTableFilter()（复位就写在筛选控件自己的处理里）。
+     为什么不放 refresh() 入口：refresh 的入口不止筛选——「刷新」按钮、保存/删除/
+     导入之后的重取、mount() 都调它，那些场景人只是想看同一页的新数据，踢回第 1 页
+     反而找不到刚改的那一行（与 Report.save() 留在当前页同一语义）。 */
+  onFilter(){
+    App.pagerState("events").page = 1;
+    return this.refresh();
   },
 
   async refresh(){
@@ -89,11 +109,20 @@ const EV = {
       this.counts = r.counts || {};
       this.limits = r.limits || this.limits || {};
       this.opts = Object.assign(this.opts, r.options || {});
+      /* CF-7：draw 登记必须站在取数路径上（原来只在 mount() 里写一次）。
+         #evPager 是静态容器，Task 3 已把它整段搬进 /devices#tab=events；搬家时那行
+         <script>EV.mount();</script> 一旦漏加或换了顺序，st.draw 就是空的，
+         common.js 的翻页监听会退回全局 render()——页码写进了 S.pager 却没人重画
+         #evList，表现是「点了没反应」，而且一条错误都不抛，最难查。登记跟着取数
+         走就没有这个死角：任何一次取数成功都会把它补上。写法照 report.js:12 /
+         model-center.js:62 / page-devices.js:79。 */
+      App.pagerState("events").draw = () => EV.renderList();
       this.renderChips();
       this.renderList();
       this.renderCodes();
       this.syncForm();
-    }catch(e){ box.innerHTML = `<div class="empty">加载失败：${App.esc(e.message)}</div>`; }
+    }catch(e){ box.innerHTML = `<div class="empty">加载失败：${App.esc(e.message)}</div>`;
+      const pe = App.byId("evPager"); if (pe) pe.innerHTML = ""; }   // 取数失败就不留上一页的分页条：点了会用内存里的旧快照盖掉这条错误
   },
 
   renderCodes(){
@@ -128,14 +157,16 @@ const EV = {
               : "已确认失效事件不够多，「最可能故障」和「剩余寿命」都训不动——先把现场的失效记录录进来。")
           : "投运、计划检修、更换复位这些记录用来把非故障的停机从剩余寿命标签里摘出去。"
       }</div>`;
+      const p0 = App.byId("evPager"); if (p0) p0.innerHTML = "";
       return;
     }
+    const pg = App.paginate(this.rows, "events");
     const fault = this.table === "fault_events";
     box.innerHTML = `<div class="table-scroll"><table class="mc-table"><tr>` +
       (fault ? `<th>编号</th><th>失效时间</th><th>故障类型</th><th>程度</th><th>处理措施</th><th>恢复时间</th>`
              : `<th>编号</th><th>事件时间</th><th>事件类型</th><th>备注</th>`) +
       `<th>来源</th><th>状态</th><th>操作</th></tr>` +
-      this.rows.map(r => `<tr>
+      pg.rows.map(r => `<tr>
         <td>${App.esc(r.code)}</td>
         <td>${App.esc(fault ? r.fail_time : r.event_time)}</td>
         <td>${App.esc(fault ? r.fault_type : r.kind)}</td>
@@ -146,6 +177,9 @@ const EV = {
         <td><button class="btn ghost small" onclick="EV.setEditing(${r.id})">改</button>
             <button class="btn danger small" onclick="EV.del(${r.id})">删</button></td>
       </tr>`).join("") + `</table></div>`;
+    const p = App.byId("evPager");
+    if (p) p.innerHTML = pg.pages > 1
+      ? App.pagerHTML("events", pg.page, pg.pages, this.rows.length, pg.size) : "";
   },
 
   sourceText(r){
@@ -226,6 +260,7 @@ const EV = {
 
   async save(){
     const body = this.collect();
+    const isNew = !this.editingId;          // resetForm() 会把 editingId 清零，判定必须提前取
     try{
       const url = this.editingId ? this.apiBase() + "/update" : this.apiBase();
       if (this.editingId) body.id = this.editingId;
@@ -233,8 +268,20 @@ const EV = {
                           body: JSON.stringify(body)});
       this.showErr("");
       this.resetForm();
+      /* 控制器裁定（M-b）：复位只补在「行集被这次动作改了」的现场。新增会插进一行，
+         而 /api/fault-events 按失效时间倒序（equipment_db.py 的 ORDER BY），新行必然
+         落在第 1 页——人停在第 3 页就永远看不见自己刚录的那条，所以新增分支回第 1 页。
+         编辑已有记录行集没变，不复位，保存完留在原地；refresh() 入口仍然永远不复位
+         （那条语义由 ⑥a/⑥b/⑥c 三条反向钉闩着）。 */
+      if (isNew) App.pagerState("events").page = 1;
       await this.refresh();
-      await MC.refresh();                       // 事件条数变了，训练中心的「还差几条」要跟着变
+      /* Task 3 删掉了这里那句「await 训练中心刷新」（save / del / runImport 三处一起删）：
+         它调的是 model-center.js 的 ModelCenter 全局，事件分区搬来 /devices 之后这一页
+         根本不加载那个脚本，语句会抛 ReferenceError，被本函数这个 catch 接住、
+         在**已经写成功**之后报「没写进去：ModelCenter is not defined」。
+         也不留 if (window.ModelCenter) 的假兼容：跨页实时刷新在搬家后没有消费者——
+         训练中心自己的 15 秒轮询（common.js watchRemoteChange）会取到新条数。
+         自查口径：本文件里对 ModelCenter 的调用为 0（grep -c "MC[.]" 应为 0）。 */
     }catch(e){ this.showErr("没写进去：" + e.message); }
   },
 
@@ -245,7 +292,7 @@ const EV = {
         headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})});
       if (this.editingId === id) this.resetForm();
       await this.refresh();
-      await MC.refresh();
+      // Task 3：删掉了「await 训练中心刷新」那一句，理由见 save() 里那段注释
     }catch(e){ alert(e.message); }
   },
 
@@ -292,7 +339,7 @@ const EV = {
       this.renderPreview(r);
       if (!dry && !r.dry_run){
         await this.refresh();
-        await MC.refresh();
+        // Task 3：删掉了「await 训练中心刷新」那一句，理由见 save() 里那段注释
       }
     }catch(e){
       this.renderPreview({error: e.message});
@@ -347,8 +394,8 @@ const EV = {
         <option value="fault_events"${fault ? " selected" : ""}>故障事件（失效记录）</option>
         <option value="lifecycle"${fault ? "" : " selected"}>设备生命周期（投运 / 检修 / 更换）</option>
       </select>
-      <select id="evFilterCode" onchange="EV.refresh()"></select>
-      ${fault ? `<select id="evFilterStatus" onchange="EV.refresh()">
+      <select id="evFilterCode" onchange="EV.onFilter()"></select>
+      ${fault ? `<select id="evFilterStatus" onchange="EV.onFilter()">
           <option value="">全部状态</option><option value="confirmed">只看已确认</option>
           <option value="pending">只看待确认</option></select>` : ""}
       <button class="btn ghost small" onclick="EV.refresh()">刷新</button>
@@ -361,6 +408,9 @@ const EV = {
   mount(){
     const box = App.byId("evHead");
     if (box) box.innerHTML = this.headHTML();
+    /* 这里原来有一行 App.pagerState("events").draw = () => EV.renderList()：
+       它和取数路径上的那次登记是同一件事，留两处就是两套机制，Task 3 搬家时
+       很容易只改到这一处。登记单点收在 refresh() 的成功分支（见 CF-7 注释）。 */
     this.renderForm();
     this.refresh();
   },

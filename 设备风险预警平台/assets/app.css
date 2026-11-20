@@ -347,3 +347,17 @@ footer{text-align:center;color:#7d93aa;font-size:12px;padding:10px 0 26px}
 .mc-table td,.mc-table th{padding:8px;border-bottom:1px solid var(--line);text-align:left;font-size:12px}
 .pill{border-radius:20px;padding:3px 9px;background:#edf4fc;color:#0d5ea8;font-size:12px}
 .good{color:#21834c}.bad{color:#b02a20}
+
+/* ---------------------------------------------------------------- 页内页签 */
+/* 4 个页面各有一组：页签只切显示，数据仍由 boot() 的 15 秒轮询统一取，
+   所以非活动面板用 hidden（真隐藏，不参与命中测试与读屏），不是半透明遮罩。 */
+.tabs{display:flex;gap:2px;flex-wrap:nowrap;overflow-x:auto;scroll-snap-type:x proximity;
+  border-bottom:2px solid var(--line);margin:0 0 14px;padding:0}
+.tab-btn{flex:0 0 auto;min-height:44px;padding:9px 16px;border:0;border-bottom:3px solid transparent;
+  background:none;color:var(--muted);font-size:14px;cursor:pointer;white-space:nowrap;scroll-snap-align:start}
+.tab-btn:hover{color:var(--tx)}
+.tab-btn[aria-selected="true"]{color:var(--blue-700);border-bottom-color:var(--blue-700);font-weight:600}
+.tab-btn:focus-visible{outline:2px solid var(--blue-500);outline-offset:-2px}
+.tab-panel[hidden]{display:none}
+@media (max-width:640px){.tabs{margin:0 -4px 12px}.tab-btn{font-size:13px;padding:9px 12px}}
+@media print{.tabs{display:none}}

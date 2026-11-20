@@ -8,11 +8,15 @@ const S = {
   state: null,
   editing: null,
   calibCode: null,
+  // boot() 幂等闸门：合并后的页面加载两份脚本、各自都调 App.boot()
+  booted: false,
   // cardPage / rowPage：这两处列表每页默认多少条（0 = 不分页，全量铺开）
   cfg: {cardPage: 0, rowPage: 0, fullTable: false, env: false},
   tblQ: "",            // 台账搜索词（编号 / 名称 / 巷道 / 类型）
   tblLevel: "",        // 台账分级筛选，空 = 全部
-  pager: {cards: {page: 1, size: 12}, table: {page: 1, size: 24}, ai: {page: 1, size: 12}},
+  pager: {cards: {page: 1, size: 12}, table: {page: 1, size: 24}, ai: {page: 1, size: 12},
+          report: {page: 1, size: 10}, samples: {page: 1, size: 20},
+          events: {page: 1, size: 20}, worklog: {page: 1, size: 20}},
   hooks: {onState: [], onRender: []},
   // 导入抽屉的临时状态：文件原文只在内存里，服务端预检过了才允许真写
   imp: {text: "", name: "", summary: null, canApply: false, phase: "idle"},
@@ -276,8 +280,14 @@ function cardHTML(d){
 /* 台账会一直往里加设备，首页卡片和台账表格不可能一次全铺完，所以两处共用一套分页：
    每页条数可选 + 上一页/下一页 + 页码窗口（当前页居中，两端省略号）。
    页码存在 S.pager 里，15 秒轮询重绘时不会跳回第一页；数据变少（删设备、筛选变窄）
-   导致页码越界时自动收到最后一页。 */
+   导致页码越界时自动收到最后一页。
+   维护记录/故障事件/样本/核查卡这四个长列表接同一套原语，只差每页条数档位、
+   量词，和「翻页之后重画哪一个列表」（pager 项上的可选 draw）。 */
 const PAGER_SIZES = [12, 24, 48, 100];
+/* 一行一条的列表和一张一屏的卡片不是一套节奏：核查卡 10 起，其余 20 起。 */
+const PAGER_OPTS = {cards: PAGER_SIZES, table: PAGER_SIZES, ai: PAGER_SIZES,
+                    report: [10, 20, 50], samples: [20, 50, 100], events: [20, 50, 100], worklog: [20, 50, 100]};
+const PAGER_UNIT = {report: "台", samples: "条", events: "条", worklog: "条"};
 
 function pageWindow(cur, pages){
   if (pages <= 7) return Array.from({length: pages}, (_, i) => i + 1);
@@ -300,10 +310,10 @@ function pagerHTML(key, cur, pages, total, size){
     // 当前页只做高亮，不置灰：置灰后和"到头了"的上/下一页分不清
     ? `<span class="pg-ell">…</span>` : btn(x, x, false)).join("");
   return `<div class="pager">
-    <span class="pg-info">共 ${total} 台 · 第 ${cur} / ${pages} 页</span>
+    <span class="pg-info">共 ${total} ${PAGER_UNIT[key] || "台"} · 第 ${cur} / ${pages} 页</span>
     <select data-pager="${key}" data-size="1" aria-label="每页显示条数">` +
-      PAGER_SIZES.map(n =>
-        `<option value="${n}"${n === size ? " selected" : ""}>每页 ${n} 台</option>`).join("") +
+      (PAGER_OPTS[key] || PAGER_SIZES).map(n =>
+        `<option value="${n}"${n === size ? " selected" : ""}>每页 ${n} ${PAGER_UNIT[key] || "台"}</option>`).join("") +
     `</select>${btn("‹ 上一页", cur - 1, cur <= 1)}${win}${btn("下一页 ›", cur + 1, cur >= pages)}</div>`;
 }
 
@@ -323,8 +333,11 @@ function bindPager(){
   document.addEventListener("click", e => {
     const b = e.target.closest && e.target.closest("[data-pager][data-page]");
     if (!b || b.disabled) return;
-    S.pager[b.dataset.pager].page = Number(b.dataset.page) || 1;
-    render();
+    const st = S.pager[b.dataset.pager];
+    st.page = Number(b.dataset.page) || 1;
+    /* 一页只画一个列表：看板卡片/台账表这些走整页重绘，其余列表各自登记自己的
+       draw，翻页就不再顺带把无关的分区和它的取数一起重跑一遍。 */
+    st.draw ? st.draw() : render();
   });
   document.addEventListener("change", e => {
     const sel = e.target.closest && e.target.closest("[data-pager][data-size]");
@@ -332,7 +345,7 @@ function bindPager(){
     const st = S.pager[sel.dataset.pager];
     st.size = Number(sel.value) || 0;
     st.page = 1;                       // 换了每页条数，回到第一页最不容易看串行
-    render();
+    st.draw ? st.draw() : render();
   });
 }
 
@@ -1099,13 +1112,76 @@ function injectNav(){
   document.body.insertBefore(nav, main || document.body.firstChild);
 }
 
+/* ---------- 页内页签 ----------
+   页签状态放在 URL hash（/#tab=events）：书签、前进后退、别的页面深链都落在同一处。
+   切换只动 aria-selected 与面板 hidden，不发请求 —— 取数仍归 boot() 的 15 秒轮询。
+   每页一组；hash 缺失或写了本页没有的页签，一律落第一个，不白屏。 */
+function tabFromHash(){
+  // 手打的坏百分号（#tab=%E4%B8）会让 decodeURIComponent 抛 URIError；这里必须吞掉：
+  // tabFromHash 在 boot() 中段的 initTabs() 里被调，抛出会把整次 boot 断掉（委托绑一半、轮询起不来）。
+  let hash = "";
+  try { hash = decodeURIComponent(location.hash.slice(1)); } catch (e) { return ""; }
+  const m = /(?:^|[&?])tab=([^&]+)/.exec(hash);
+  return m ? m[1] : "";
+}
+
+function activateTab(bar, id, push){
+  const btns = [...bar.querySelectorAll(".tab-btn")];
+  if (!btns.length) return "";
+  const hit = btns.find(b => b.dataset.tab === id) || btns[0];
+  btns.forEach(b => b.setAttribute("aria-selected", String(b === hit)));
+  hit.tabIndex = 0;
+  btns.filter(b => b !== hit).forEach(b => { b.tabIndex = -1; });
+  const panels = bar.parentElement ? [...bar.parentElement.querySelectorAll(":scope > .tab-panel")] : [];
+  panels.forEach(p => { p.hidden = p.id !== hit.getAttribute("aria-controls"); });
+  if (push && location.hash !== "#tab=" + hit.dataset.tab) {
+    // replaceState 不压历史栈：后退键应该退到上一页，而不是退回上一个页签
+    history.replaceState(null, "", "#tab=" + hit.dataset.tab);
+  }
+  return hit.dataset.tab;
+}
+
+function tabBars(){ return [...document.querySelectorAll(".tabs")]; }
+
+function initTabs(){
+  tabBars().forEach(bar => {
+    bar.addEventListener("click", e => {
+      const b = e.target.closest(".tab-btn");
+      if (b && bar.contains(b)) activateTab(bar, b.dataset.tab, true);
+    });
+    bar.addEventListener("keydown", e => {
+      const btns = [...bar.querySelectorAll(".tab-btn")];
+      const at = btns.indexOf(document.activeElement);
+      if (at < 0) return;
+      let to = -1;
+      if (e.key === "ArrowRight") to = (at + 1) % btns.length;
+      else if (e.key === "ArrowLeft") to = (at - 1 + btns.length) % btns.length;
+      else if (e.key === "Home") to = 0;
+      else if (e.key === "End") to = btns.length - 1;
+      if (to < 0) return;
+      e.preventDefault();
+      btns[to].focus();
+      activateTab(bar, btns[to].dataset.tab, true);
+    });
+    activateTab(bar, tabFromHash(), false);
+  });
+  window.addEventListener("hashchange", () => {
+    const id = tabFromHash();
+    if (id) tabBars().forEach(bar => activateTab(bar, id, false));
+  });
+}
+
 function boot(cfg){
   S.cfg = Object.assign({}, S.cfg, cfg || {});
+  // 合并后的页面会加载两份脚本、各自都调 boot；不挡住就绑两套事件委托、起两个 15 秒轮询。
+  if (S.booted) return;
+  S.booted = true;
   // 每页条数的默认值由页面传入，用户在下拉里改过就以用户选的为准
   S.pager.cards.size = S.cfg.cardPage || 0;
   S.pager.table.size = S.cfg.rowPage || 0;
   injectChrome();
   injectNav();
+  initTabs();
   fillHmNotes();
   const here = location.pathname.replace(/\.html$/, "") || "/";
   document.querySelectorAll(".nav a").forEach(a => {
@@ -1128,6 +1204,7 @@ function boot(cfg){
 const App = {
   boot, load, esc, fmt, byId, has, api, factorTable, openDrawer, closeDrawer, closeAll,
   paginate, pagerHTML,
+  pagerState: key => S.pager[key],
   state: () => S.state,
   cfg: () => S.cfg,
   device: code => (S.state ? S.state.devices.find(d => d.code === code) : null),

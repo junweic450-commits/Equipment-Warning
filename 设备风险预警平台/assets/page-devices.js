@@ -16,6 +16,8 @@ bindWorkLog();
 
 /* ---------------------------------------------------------------- 设备维护信息：工作日志解析、待确认、维护历史检索/编辑/删除 */
 let WORK_DRAFTS = [];
+// 维护历史这一份列表的行：分页只在这已经取回来的数组里切页，不再另发一次 /api
+const WR = {rows: []};
 // 与服务端 equipment_db.WORK_FIELDS 同一套上限：界面先挡住，省得填完提交才报错
 const WORK_LIMIT = {work_date:40, location:100, equipment:200, content:5000, result:500, workers:300};
 function workDraftHTML(r, i){
@@ -49,6 +51,10 @@ async function confirmWorkRecords(){
   try{
     const res=await App.api("/api/work-records/confirm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({records})});
     alert(`处理完成：新增 ${res.added} 条，重复记录刷新上传时间 ${res.refreshed} 条。`);
+    /* 控制器裁定（M-b）：只有真新增了行才回第 1 页——维护历史按 work_date DESC 排，
+       新入账的记录在第 1 页，人停在第 3 页就看不到自己刚确认的那批。全是重复上传
+       （added=0）时行集没变，页码不动。 */
+    if (Number(res.added) > 0) App.pagerState("worklog").page = 1;
     clearWorkPreview(); byId("workLogText").value=""; await loadWorkRecords();
   }catch(e){alert(e.message);}
 }
@@ -73,16 +79,35 @@ async function loadWorkRecords(params={}){
   try{
     const qs=new URLSearchParams(params).toString();
     const res=await App.api("/api/work-records"+(qs?`?${qs}`:""));
-    const rows=res.records||[];
-    byId("workRecordCount").textContent=`维护历史 ${rows.length} 条`;
-    byId("workRecordList").innerHTML=rows.map(workRecordHTML).join("")||`<div class="empty">没有找到维护记录。</div>`;
-  }catch(e){byId("workRecordList").textContent="维护记录加载失败："+e.message;}
+    WR.rows=res.records||[];
+    App.pagerState("worklog").draw=renderWorkRows;
+    renderWorkRows();
+  }catch(e){
+    /* M-c 定的顺序（CF-8）：两处取值都加守卫，且先清分页条、再写错误文案。
+       原来 catch 第一行是 byId("workRecordList").textContent= ——容器缺失时（Task 3
+       搬家途中 / 面板还没渲染）这里会从 catch 里再抛出去，把调用方的流程打断；
+       而先写文案后清分页条，中间那一下「有错误文案、也有上一页按钮」的窗口，
+       点上就会拿内存里的旧 WR.rows 把这条错误刷没。写法照 report.js:14-19 /
+       model-center.js:82-88。 */
+    const p=byId("workRecordPager"); if(p) p.innerHTML="";   // 取数失败就不留上一页的分页条：点它会拿内存里的旧快照盖掉这条错误
+    const box=byId("workRecordList"); if(box) box.textContent="维护记录加载失败："+e.message;}
+}
+function renderWorkRows(){
+  const box=byId("workRecordList"); if(!box)return;
+  const pg=App.paginate(WR.rows,"worklog");
+  box.innerHTML=pg.rows.map(workRecordHTML).join("")||`<div class="empty">没有找到维护记录。</div>`;
+  const p=byId("workRecordPager");
+  if(p)p.innerHTML=pg.pages>1?App.pagerHTML("worklog",pg.page,pg.pages,WR.rows.length,pg.size):"";
+  const c=byId("workRecordCount"); if(c)c.textContent=`维护历史 ${WR.rows.length} 条`;
 }
 function searchWorkRecords(){
+  App.pagerState("worklog").page=1;   // 条件变了还停在第 3 页，看着就像搜丢了
   loadWorkRecords({keyword:byId("workKeyword").value.trim(),field:byId("workField").value,value:byId("workFieldValue").value.trim()});
 }
 function resetWorkSearch(){
-  byId("workKeyword").value="";byId("workField").value="";byId("workFieldValue").value="";loadWorkRecords();
+  byId("workKeyword").value="";byId("workField").value="";byId("workFieldValue").value="";
+  App.pagerState("worklog").page=1;
+  loadWorkRecords();
 }
 function editWorkRecord(id,show=true){const el=byId("workEdit"+id);if(el)el.hidden=!show;}
 async function saveWorkRecord(id){

@@ -8,8 +8,23 @@ const Report={
       document.getElementById("reportDate").textContent="报告日期："+r.date;
       document.getElementById("reportModel").textContent="模型版本："+(r.model_version||"基础模型");
       const list=(r.items||[]).filter(x=>x.device.risk!==null&&x.device.risk!==undefined);
-      box.innerHTML=list.map(x=>Report.card(x,r.date)).join("")||'<div class="empty">今日没有可预测的设备。请先检查数据导入和模型状态。</div>';
-    }catch(e){box.textContent="报告加载失败："+e.message;}
+      Report.rows=list; Report.date=r.date;
+      App.pagerState("report").draw=Report.render;
+      Report.render();
+    }catch(e){
+      /* M-c 定的顺序：先清分页条、再写错误文案，两处都加守卫。
+         原来这两行是反的，而且 box 取值没守卫——容器缺失（Task 4 把核查分区搬走
+         的途中）时会从 catch 里再抛出去，污染调用方（load() 还被跨页刷新与轮询调）。 */
+      const pe=document.getElementById("reportPager"); if(pe) pe.innerHTML="";
+      if(box) box.textContent="报告加载失败："+e.message;}   // 取数失败就不留上一页的分页条：点它会拿内存里的旧快照盖掉这条错误
+  },
+  render(){
+    const box=document.getElementById("reportItems"); if(!box) return;
+    const pg=App.paginate(Report.rows||[], "report");
+    box.innerHTML=(pg.rows||[]).map(x=>Report.card(x, Report.date)).join("")||
+      '<div class="empty">今日没有可预测的设备。请先检查数据导入和模型状态。</div>';
+    const p=document.getElementById("reportPager");
+    if(p) p.innerHTML=pg.pages>1?App.pagerHTML("report",pg.page,pg.pages,(Report.rows||[]).length,pg.size):"";
   },
   card(x,date){
     const d=x.device,t=d.telemetry||{},p=x.report||{},logs=x.work_logs||[];

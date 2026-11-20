@@ -36,6 +36,14 @@ const MC={
     }catch(e){box.innerHTML=`<div class="warn">训练失败：${App.esc(e.message)}</div>`;}
     finally{btn.disabled=false;btn.textContent=o.label;}
   },
+  /* 筛选变更点：#mcFilter 的 onchange 只走这里（写法照 common.js bindTableFilter，
+     复位挂在条件变化那一刻）。不放 refresh() 入口：它还被本页的「刷新数据」、
+     训练/审批写完后的重取、以及事件脚本的跨页调用触达，那些不是换了一批行，
+     把人从第 4 页踢回第 1 页就再也找不到自己正在看的那条样本。 */
+  onFilter(){
+    App.pagerState("samples").page=1;
+    return MC.refresh();
+  },
   async refresh(){
     const status=document.getElementById("mcFilter")?.value||"pending";
     try{
@@ -50,7 +58,9 @@ const MC={
         ["待确认样本",s.pending_samples||0],["已标注故障类型",s.labeled_types||0],
         ["已生成失效事件",s.linked_events||0],["待审批模型",s.pending_approvals||0]
       ].map(x=>`<div class="mc-stat"><b>${App.esc(x[1])}</b><span>${App.esc(x[0])}</span></div>`).join("");
-      document.getElementById("mcSamples").innerHTML=(r.data.samples||[]).map(MC.sampleHTML).join("")||'<div class="empty">当前筛选下没有样本。首页或设备页面加载到最新遥测后，系统会自动保存可反馈样本。</div>';
+      MC.samples=(r.data.samples)||[];
+      App.pagerState("samples").draw=MC.renderSamples;
+      MC.renderSamples();
       const history=[...(s.history||[])];
       if(s.active_version!=="V1.0-基础模型") history.push({version:"V1.0-基础模型",status:"published",dataset_size:"—",feedback_count:"—",metrics:{},message:"系统初始基础模型（可作为回退版本）"});
       document.getElementById("mcHistory").innerHTML=history.map(h=>{
@@ -69,7 +79,13 @@ const MC={
       MC.health=r.health||null;
       const hc=document.getElementById("mcHealth");
       if(hc) hc.innerHTML=MC.healthHTML(MC.health);
-    }catch(e){document.getElementById("mcSamples").textContent="加载失败："+e.message;}
+    }catch(e){
+      /* M-c 定的顺序：先清分页条、再写错误文案，两处都加守卫。原来 mcSamples 的
+         getElementById(...).textContent= 没守卫，容器缺失时（Task 4 搬家途中）这条
+         异常会从 catch 里再抛出去——而 events.js 有三处 await MC.refresh() 落在自己的
+         try 里，会被它 :258 的 catch 误报成「没写进去：…」，看着像事件没存上。 */
+      const pe=document.getElementById("mcSamplesPager"); if(pe) pe.innerHTML="";
+      const sBox=document.getElementById("mcSamples"); if(sBox) sBox.textContent="加载失败："+e.message;}
   },
   /* ---------------- 分类 / 剩余寿命模型：风险概览那两列的来源 ---------------- */
   covText(m){
@@ -140,6 +156,14 @@ ${rows?'<div class="sub-title" style="margin-top:10px">训练与审批记录</di
       confirm:"确认把"+MC.kindLabel(kind)+"模型回滚到 "+version+"？",
       fallback:"已回滚", failText:"回滚失败："});
   },
+  renderSamples(){
+    const box=document.getElementById("mcSamples"); if(!box) return;
+    const pg=App.paginate(MC.samples||[], "samples");
+    box.innerHTML=pg.rows.map(MC.sampleHTML).join("")||
+      '<div class="empty">当前筛选下没有样本。首页或设备页面加载到最新遥测后，系统会自动保存可反馈样本。</div>';
+    const p=document.getElementById("mcSamplesPager");
+    if(p) p.innerHTML=pg.pages>1?App.pagerHTML("samples",pg.page,pg.pages,(MC.samples||[]).length,pg.size):"";
+  },
   sampleHTML(x){
     const f=x.features||{};const label=x.feedback_kind==="normal"?"正常":x.feedback_kind==="fault"?"确认故障":x.feedback_kind==="anomaly"?"确认异常":"待确认";
     return `<article class="sample"><div class="sample-hd"><b>${App.esc(x.code)} · ${App.esc(x.sim_time)}</b><span class="pill">${App.esc(label)}</span></div><div class="hint">样本 #${x.id}　预测故障概率：${x.predicted_probability==null?"—":(x.predicted_probability*100).toFixed(1)+"%"}　模型：${App.esc(x.model_version||"—")}</div><div class="sample-values"><span>环境温度：${f.env_temp??"—"} ℃</span><span>设备温度：${f.dev_temp??"—"} ℃</span><span>电流：${f.current??"—"} A</span><span>运行时长：${f.run_hours??"—"} h</span><span>距检修：${f.since_repair_hours??"—"} h</span></div><label>工作人员判断</label><select id="mcKind${x.id}" onchange="MC.toggle(${x.id})"><option value="normal" ${x.feedback_kind==="normal"?"selected":""}>正常运行 / 误报（训练标签 0）</option><option value="fault" ${x.feedback_kind==="fault"?"selected":""}>确认设备故障（训练标签 1）</option><option value="anomaly" ${x.feedback_kind==="anomaly"?"selected":""}>确认异常但未确认故障（暂不训练）</option><option value="uncertain" ${x.feedback_kind==="uncertain"?"selected":""}>暂不确定</option></select>${MC.labelHTML(x)}<div class="row2"><div><label>确认人员</label><input id="mcReviewer${x.id}" maxlength="80" value="${App.esc(x.reviewer||"")}" placeholder="填写工作人员姓名"/></div><div><label>反馈说明</label><input id="mcNote${x.id}" maxlength="1000" value="${App.esc(x.feedback_note||"")}" placeholder="例如：现场检查后确认轴承故障"/></div></div><div class="btn-row"><button class="btn small" onclick="ModelCenter.save(${x.id})">保存反馈</button></div></article>`;
@@ -168,7 +192,9 @@ ${rows?'<div class="sub-title" style="margin-top:10px">训练与审批记录</di
     }
     try{const r=await App.api("/api/model-feedback",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});alert((r.message||"反馈已保存。")+"\n注意：本次只记录标签，尚未触发模型训练。");
     // 待确认筛选下，刚保存的样本会当场从列表里消失，看着就像「我这条判断没保住」。把它领到「已反馈」那一栏，让人看见自己填的东西。
-    const flt=document.getElementById("mcFilter");if(r.status==="reviewed"&&flt&&flt.value==="pending")flt.value="reviewed";
+    const flt=document.getElementById("mcFilter");
+    // 筛选值在这里被程序化改掉，复位就跟着这个变更点走（refresh 入口不复位）
+    if(r.status==="reviewed"&&flt&&flt.value==="pending"){flt.value="reviewed";App.pagerState("samples").page=1;}
     await MC.refresh();}catch(e){alert(e.message);}
   },
   train(){
