@@ -390,11 +390,6 @@ def delete_work_record(record_id):
     return cur.rowcount > 0
 
 
-def get_work_records(limit=300):
-    """获取最近工作维护记录。"""
-    return search_work_records(limit=limit)
-
-
 # --------------------------------------------------------------------------
 # 故障事件 / 设备生命周期
 # 两张表刻意共用同一套字段闸：录入、批量导入、编辑走的是同一个 clean_event_record，

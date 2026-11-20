@@ -1,0 +1,58 @@
+{
+  "passed": true,
+  "results": [
+    {
+      "route": "/",
+      "nav": [
+        "风险概览",
+        "今日核查",
+        "设备台账",
+        "模型训练"
+      ],
+      "tab": "board",
+      "panels": 2,
+      "errors": [],
+      "devices": 4
+    },
+    {
+      "route": "/report#tab=samples",
+      "nav": [
+        "风险概览",
+        "今日核查",
+        "设备台账",
+        "模型训练"
+      ],
+      "tab": "samples",
+      "panels": 2,
+      "errors": [],
+      "devices": 4
+    },
+    {
+      "route": "/devices#tab=events",
+      "nav": [
+        "风险概览",
+        "今日核查",
+        "设备台账",
+        "模型训练"
+      ],
+      "tab": "events",
+      "panels": 4,
+      "errors": [],
+      "devices": 4
+    },
+    {
+      "route": "/model-center#tab=history",
+      "nav": [
+        "风险概览",
+        "今日核查",
+        "设备台账",
+        "模型训练"
+      ],
+      "tab": "history",
+      "panels": 3,
+      "errors": [],
+      "devices": 4
+    }
+  ],
+  "exceptions": []
+}

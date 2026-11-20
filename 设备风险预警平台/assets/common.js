@@ -54,7 +54,7 @@ async function api(path, options){
 }
 
 /* ---------------------------------------------------------------- 跨页签同步 */
-/* 台账一改，另外两个页签（风险概览 / 智能分析）要立刻跟上。只靠 15 秒轮询不够：
+/* 台账一改，首页看板与归因页签要立刻跟上。只靠 15 秒轮询不够：
    浏览器会把后台页签的定时器压到几乎不跑，导完切回概览页看到的还是导入前的数字。
    BroadcastChannel 可用就用它，不可用退回 localStorage 的 storage 事件，效果一样。 */
 const SYNC_KEY = "pex.ledger.changed";
@@ -363,7 +363,7 @@ function renderCards(){
     const more = byId("cardsMore");
     more.innerHTML = all.length
       ? `<span class="more-label">快捷入口</span>` +
-        `<a class="link" href="/risk">智能分析（归因与治理方案）</a>` +
+        `<a class="link" href="/#tab=analysis">归因与治理（本页第二个页签）</a>` +
         `<a class="link" href="/devices">设备台账（录入与维护）</a>`
       : "";
     more.hidden = !all.length;
@@ -848,7 +848,7 @@ async function runImport(){
     S.imp.text = "";
     S.imp.xlsx = "";
     byId("importFile").value = "";
-    // 本页立刻重画，另外两个页签（风险概览 / 智能分析）同时收到广播
+    // 本页立刻重画，首页看板与归因页签同时收到广播
     await changed();
   }catch(e){
     /* 服务端逐条写入，失败时前面的行已经落库，所以这里也要刷新一遍状态，
@@ -992,7 +992,7 @@ function bindDelegates(){
 
 /* ---------------------------------------------------------------- 启动入口 */
 /* 遮罩 + 三个抽屉在三个页面里完全一样，改由 JS 注入一次，避免同一份标记
-   在 index/risk/devices 里各抄一遍、日后改一处漏两处。 */
+   在 各页面 里各抄一遍、日后改一处漏两处。 */
 const CHROME_HTML = `
 <div class="mask" id="mask"></div>
 <aside class="drawer" id="calibDrawer">
@@ -1095,11 +1095,10 @@ function injectChrome(){
    页面 HTML 里没写 .nav 就自动生成，写了就用页面自己的（万一要临时加页签）。
    每一项都带一句话说明"这页干什么"，鼠标悬停能看，现场人员不容易点错。 */
 const NAV_ITEMS = [
-  {href: "/", label: "风险概览", title: "今天哪几台最该管，为什么"},
-  {href: "/risk", label: "智能分析", title: "全设备归因、治理方案、一台一台看"},
-  {href: "/devices", label: "设备台账", title: "录入维护设备信息、巷道环境温度"},
-  {href: "/report", label: "今日报告", title: "核实风险设备、记录故障原因和处理办法"},
-  {href: "/model-center", label: "模型训练中心", title: "人工反馈、训练数据和 HGBT 模型迭代"},
+  {href: "/", label: "风险概览", title: "今天哪几台最该管，为什么高、怎么降"},
+  {href: "/report", label: "今日核查", title: "核实风险设备、反馈运行样本"},
+  {href: "/devices", label: "设备台账", title: "设备信息、维护日志与环境基准"},
+  {href: "/model-center", label: "模型训练", title: "两套模型的训练、审批与回滚"},
 ];
 
 function injectNav(){
@@ -1113,7 +1112,7 @@ function injectNav(){
 }
 
 /* ---------- 页内页签 ----------
-   页签状态放在 URL hash（/#tab=events）：书签、前进后退、别的页面深链都落在同一处。
+   页签状态放在 URL hash（例如 /#tab=analysis）：书签、前进后退、深链都落在同一处。
    切换只动 aria-selected 与面板 hidden，不发请求 —— 取数仍归 boot() 的 15 秒轮询。
    每页一组；hash 缺失或写了本页没有的页签，一律落第一个，不白屏。 */
 function tabFromHash(){
@@ -1138,6 +1137,7 @@ function activateTab(bar, id, push){
     // replaceState 不压历史栈：后退键应该退到上一页，而不是退回上一个页签
     history.replaceState(null, "", "#tab=" + hit.dataset.tab);
   }
+  document.dispatchEvent(new CustomEvent("app:tabchange", {detail:{tab:hit.dataset.tab}}));
   return hit.dataset.tab;
 }
 
@@ -1167,7 +1167,7 @@ function initTabs(){
   });
   window.addEventListener("hashchange", () => {
     const id = tabFromHash();
-    if (id) tabBars().forEach(bar => activateTab(bar, id, false));
+    tabBars().forEach(bar => activateTab(bar, id, false));
   });
 }
 

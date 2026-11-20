@@ -322,13 +322,13 @@ function openWithDevice(code){
 
 /* ---------------------------------------------------------------- 会话渲染 */
 /* 上下文那行小字：五个页面都有问答入口了，这里的名字必须和顶部导航一致
-   （/risk 已改名「智能分析」），对不上的路径别再冒充「设备台账」。 */
-const PAGE_LABEL = {"/": "风险概览", "/risk": "智能分析", "/devices": "设备台账",
-  "/report": "今日报告", "/model-center": "模型训练中心"};
-
+   （含当前页签名称），对不上的路径别再冒充「设备台账」。 */
+const PAGE_LABEL = {"/": "风险概览", "/devices": "设备台账", "/report": "今日核查", "/model-center": "模型训练"};
 function pageLabel(){
   const here = location.pathname.replace(/\.html$/, "") || "/";
-  return PAGE_LABEL[here] || "本页";
+  const on = document.querySelector('.tab-btn[aria-selected="true"]');
+  const base = PAGE_LABEL[here === "/index" ? "/" : here] || "本页";
+  return on ? base + " · " + on.textContent.trim() : base;
 }
 
 function renderCtx(){
@@ -459,6 +459,8 @@ async function refreshChip(){
   /* 状态灯共用这一份结果；以前是这里取一遍、分析面板再取一遍，一次刷新打两次接口 */
   if (window.SmartAnalysis) SmartAnalysis.applyAgentStatus(s);
 }
+
+document.addEventListener("app:tabchange", () => { if(QA.shown) renderCtx(); });
 
 window.QA = Object.assign(QA, {
   mount(){ mount(); if (!QA.history.length) greet(); },

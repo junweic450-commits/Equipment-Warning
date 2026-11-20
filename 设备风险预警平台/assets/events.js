@@ -74,12 +74,7 @@ const EV = {
     }
     set("note", r.note);
     App.byId("evFormTitle").textContent = "改这条 · #" + r.id + "（" + r.code + "）";
-    /* Task 3 搬家改的滚动目标：原来那句写作 App.byId("tableWrap") && …，条件表达的是
-       「台账表与表单同屏」——那是事件分区还住在 /model-center 时的旧世界。搬到
-       /devices 之后 #tableWrap 与表单同页但分处两个面板（它藏在「设备信息」签里、
-       被 hidden），这个判断恒为真，什么也拦不住，只是把「同屏」这个已经不存在的前提
-       留在代码里误导读者；反过来哪一页只挂 EV 不挂台账表，滚动就会被静默跳过。
-       所以条件删掉，滚到表单自己这里就是要点题的行为。 */
+    // 编辑长列表中的记录时，将已回填的表单带回可视区。
     App.byId("evForm").scrollIntoView({block: "nearest"});
   },
 
@@ -109,13 +104,7 @@ const EV = {
       this.counts = r.counts || {};
       this.limits = r.limits || this.limits || {};
       this.opts = Object.assign(this.opts, r.options || {});
-      /* CF-7：draw 登记必须站在取数路径上（原来只在 mount() 里写一次）。
-         #evPager 是静态容器，Task 3 已把它整段搬进 /devices#tab=events；搬家时那行
-         <script>EV.mount();</script> 一旦漏加或换了顺序，st.draw 就是空的，
-         common.js 的翻页监听会退回全局 render()——页码写进了 S.pager 却没人重画
-         #evList，表现是「点了没反应」，而且一条错误都不抛，最难查。登记跟着取数
-         走就没有这个死角：任何一次取数成功都会把它补上。写法照 report.js:12 /
-         model-center.js:62 / page-devices.js:79。 */
+      // 每次取数成功都登记当前列表的分页重画函数。
       App.pagerState("events").draw = () => EV.renderList();
       this.renderChips();
       this.renderList();
@@ -127,11 +116,34 @@ const EV = {
 
   renderCodes(){
     const sel = App.byId("evFilterCode");
-    if (!sel || sel.dataset.filled) return;
-    sel.dataset.filled = "1";
+    if (!sel) return;
     const list = this.devices();
+    const signature = JSON.stringify(list);
+    if (sel.dataset.codes === signature) return;
+    const value = sel.value;
+    sel.dataset.codes = signature;
     sel.innerHTML = `<option value="">全部设备</option>` +
       list.map(c => `<option value="${App.esc(c)}">${App.esc(c)}</option>`).join("");
+    if (value && !list.includes(value)) sel.add(new Option(value, value));
+    sel.value = value;
+  },
+
+  syncDevices(){
+    // 台账请求与事件请求独立完成，只补设备选项，保留正在编辑的其他字段。
+    this.renderCodes();
+    this.renderChips();
+    const field = App.byId("ev_code"), codes = this.devices();
+    if (!field || !codes.length) return;
+    const signature = JSON.stringify(codes);
+    if (field.dataset.codes === signature) return;
+    const value = field.value;
+    const select = field.tagName === "SELECT" ? field : document.createElement("select");
+    select.id = "ev_code";
+    select.innerHTML = codes.map(c => `<option value="${App.esc(c)}">${App.esc(c)}</option>`).join("");
+    if (value && !codes.includes(value)) select.add(new Option(value, value));
+    if (value) select.value = value;
+    select.dataset.codes = signature;
+    if (select !== field) field.replaceWith(select);
   },
 
   renderChips(){
@@ -268,20 +280,12 @@ const EV = {
                           body: JSON.stringify(body)});
       this.showErr("");
       this.resetForm();
-      /* 控制器裁定（M-b）：复位只补在「行集被这次动作改了」的现场。新增会插进一行，
+      /* 复位只发生在行集改变时。新增会插入一行，
          而 /api/fault-events 按失效时间倒序（equipment_db.py 的 ORDER BY），新行必然
          落在第 1 页——人停在第 3 页就永远看不见自己刚录的那条，所以新增分支回第 1 页。
-         编辑已有记录行集没变，不复位，保存完留在原地；refresh() 入口仍然永远不复位
-         （那条语义由 ⑥a/⑥b/⑥c 三条反向钉闩着）。 */
+         编辑时行集没变，保存和普通刷新都保留当前页。 */
       if (isNew) App.pagerState("events").page = 1;
       await this.refresh();
-      /* Task 3 删掉了这里那句「await 训练中心刷新」（save / del / runImport 三处一起删）：
-         它调的是 model-center.js 的 ModelCenter 全局，事件分区搬来 /devices 之后这一页
-         根本不加载那个脚本，语句会抛 ReferenceError，被本函数这个 catch 接住、
-         在**已经写成功**之后报「没写进去：ModelCenter is not defined」。
-         也不留 if (window.ModelCenter) 的假兼容：跨页实时刷新在搬家后没有消费者——
-         训练中心自己的 15 秒轮询（common.js watchRemoteChange）会取到新条数。
-         自查口径：本文件里对 ModelCenter 的调用为 0（grep -c "MC[.]" 应为 0）。 */
     }catch(e){ this.showErr("没写进去：" + e.message); }
   },
 
@@ -292,7 +296,6 @@ const EV = {
         headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})});
       if (this.editingId === id) this.resetForm();
       await this.refresh();
-      // Task 3：删掉了「await 训练中心刷新」那一句，理由见 save() 里那段注释
     }catch(e){ alert(e.message); }
   },
 
@@ -339,7 +342,6 @@ const EV = {
       this.renderPreview(r);
       if (!dry && !r.dry_run){
         await this.refresh();
-        // Task 3：删掉了「await 训练中心刷新」那一句，理由见 save() 里那段注释
       }
     }catch(e){
       this.renderPreview({error: e.message});
@@ -408,12 +410,10 @@ const EV = {
   mount(){
     const box = App.byId("evHead");
     if (box) box.innerHTML = this.headHTML();
-    /* 这里原来有一行 App.pagerState("events").draw = () => EV.renderList()：
-       它和取数路径上的那次登记是同一件事，留两处就是两套机制，Task 3 搬家时
-       很容易只改到这一处。登记单点收在 refresh() 的成功分支（见 CF-7 注释）。 */
     this.renderForm();
     this.refresh();
   },
 };
 
 window.EV = EV;
+App.onState(() => EV.syncDevices());

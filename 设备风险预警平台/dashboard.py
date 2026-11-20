@@ -6,7 +6,7 @@
     3. 环境基准温度维护（sim_config.json）
     4. 单机工况校准抽屉（calibration.json，带留痕日志）
     5. 智能分析：本地规则引擎解读风险结果并给出可行方案（/api/analysis，
-       主页面总览区与 /risk 详情页共用同一实现）
+       风险概览的归因页签与单台抽屉共用同一实现）
     6. 云知声 Agent 问答：服务端代理，密钥不出本机（/api/agent/*，SSE 流式）
     7. 报表导出：设备风险清单 / 治理措施 / 检修排期一键导出 CSV（/api/export），
        数字取自与看板同一次分析结果，可直接拿去交班和归档
@@ -14,10 +14,11 @@
 页面（每页只干一件事，同一块内容不在两页重复出现）：
     /          风险概览：统计条 + 设备卡片（按风险从高到低，每页 12 台可翻页，
                每台卡片上是单台「AI 解读」入口）
-    /risk      智能分析：共性归因 / 治理方案 / 检修排期 / 一台一台看（可翻页）/
+    /#tab=analysis  归因与治理：共性归因 / 治理方案 / 检修排期 / 一台一台看（可翻页）/
                一键导出 CSV / AI 补充建议
-    /devices   设备台账：完整表格（可搜索、按分级筛、每页 24 行可翻页）+ 增删改 + 巷道基准温度
-    /model-center 模型训练中心：运行样本反馈、审核、HGBT 重训练与版本记录
+    /report    今日核查：风险设备核查与运行样本反馈
+    /devices   设备台账：设备信息、维护日志与环境基准
+    /model-center 模型训练：训练数据、HGBT 重训练、评估、审批、发布与回滚
 
 启动：
     python dashboard.py                # 默认 8770 端口，自动打开浏览器
@@ -1669,8 +1670,6 @@ def _read_static(rel_name):
 PAGES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/risk": ("risk.html", "text/html; charset=utf-8"),
-    "/risk.html": ("risk.html", "text/html; charset=utf-8"),
     "/devices": ("devices.html", "text/html; charset=utf-8"),
     "/devices.html": ("devices.html", "text/html; charset=utf-8"),
     "/model-center": ("model-center.html", "text/html; charset=utf-8"),
@@ -1685,7 +1684,6 @@ PAGES = {
     "/assets/analysis.js": ("assets/analysis.js", "application/javascript; charset=utf-8"),
     "/assets/chat.js": ("assets/chat.js", "application/javascript; charset=utf-8"),
     "/assets/page-main.js": ("assets/page-main.js", "application/javascript; charset=utf-8"),
-    "/assets/page-risk.js": ("assets/page-risk.js", "application/javascript; charset=utf-8"),
     "/assets/page-devices.js": ("assets/page-devices.js", "application/javascript; charset=utf-8"),
 }
 
@@ -1827,6 +1825,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        if path in ("/risk", "/risk.html"):
+            self.send_response(302)
+            self.send_header("Location", "/#tab=analysis")
+            self.end_headers()
+            return
         if path in PAGES and PAGES[path][1].startswith("text/html"):
             self._send_html(path)
         elif path in PAGES:
@@ -1883,7 +1886,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(agent_gateway.status(AGENT_CFG))
         elif path == "/api/model-center":
             try:
-                # 进入训练中心时也刷新一次预测快照，确保最新遥测可供工作人员反馈。
+                # 模型摘要和样本反馈共用此接口，先刷新最新遥测的预测快照。
                 _predict_all()
                 status = parse_qs(parsed.query).get("status", ["all"])[0]
                 self._send_json({"ok": True, "summary": model_learning.summary(),

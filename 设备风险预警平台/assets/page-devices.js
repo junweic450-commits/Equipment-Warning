@@ -51,7 +51,7 @@ async function confirmWorkRecords(){
   try{
     const res=await App.api("/api/work-records/confirm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({records})});
     alert(`处理完成：新增 ${res.added} 条，重复记录刷新上传时间 ${res.refreshed} 条。`);
-    /* 控制器裁定（M-b）：只有真新增了行才回第 1 页——维护历史按 work_date DESC 排，
+    /* 只有真新增了行才回第 1 页：维护历史按 work_date 倒序排列，
        新入账的记录在第 1 页，人停在第 3 页就看不到自己刚确认的那批。全是重复上传
        （added=0）时行集没变，页码不动。 */
     if (Number(res.added) > 0) App.pagerState("worklog").page = 1;
@@ -83,12 +83,7 @@ async function loadWorkRecords(params={}){
     App.pagerState("worklog").draw=renderWorkRows;
     renderWorkRows();
   }catch(e){
-    /* M-c 定的顺序（CF-8）：两处取值都加守卫，且先清分页条、再写错误文案。
-       原来 catch 第一行是 byId("workRecordList").textContent= ——容器缺失时（Task 3
-       搬家途中 / 面板还没渲染）这里会从 catch 里再抛出去，把调用方的流程打断；
-       而先写文案后清分页条，中间那一下「有错误文案、也有上一页按钮」的窗口，
-       点上就会拿内存里的旧 WR.rows 把这条错误刷没。写法照 report.js:14-19 /
-       model-center.js:82-88。 */
+    // 失败时清掉旧分页，避免用内存快照覆盖错误状态。
     const p=byId("workRecordPager"); if(p) p.innerHTML="";   // 取数失败就不留上一页的分页条：点它会拿内存里的旧快照盖掉这条错误
     const box=byId("workRecordList"); if(box) box.textContent="维护记录加载失败："+e.message;}
 }

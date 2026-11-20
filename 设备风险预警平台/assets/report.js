@@ -12,9 +12,7 @@ const Report={
       App.pagerState("report").draw=Report.render;
       Report.render();
     }catch(e){
-      /* M-c 定的顺序：先清分页条、再写错误文案，两处都加守卫。
-         原来这两行是反的，而且 box 取值没守卫——容器缺失（Task 4 把核查分区搬走
-         的途中）时会从 catch 里再抛出去，污染调用方（load() 还被跨页刷新与轮询调）。 */
+      // 失败时清掉旧分页，避免用内存快照覆盖错误状态。
       const pe=document.getElementById("reportPager"); if(pe) pe.innerHTML="";
       if(box) box.textContent="报告加载失败："+e.message;}   // 取数失败就不留上一页的分页条：点它会拿内存里的旧快照盖掉这条错误
   },
@@ -47,6 +45,6 @@ const Report={
     if(body.status==="fault"&&(!body.cause.trim()||!body.action.trim())){alert("确认故障时，请填写故障原因和处理办法。");return;}
     if(body.status==="no_issue"&&!body.action.trim()){alert("请填写检查结论或无故障依据。");return;}
     if(body.status==="data_corrected"&&(!body.raw_value.trim()||!body.corrected_value.trim())){alert("请填写原始值和核实值；原始遥测不会被覆盖。");return;}
-    try{const r=await App.api("/api/daily-report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});alert(r.message||"已保存");await Report.load();}catch(e){alert("保存失败："+e.message);}
+    try{const r=await App.api("/api/daily-report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});alert(r.message||"已保存");await Report.load();if(window.ModelCenter) await ModelCenter.refresh();}catch(e){alert("保存失败："+e.message);}
   }
 };window.Report=Report;Report.load();

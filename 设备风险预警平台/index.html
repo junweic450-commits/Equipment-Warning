@@ -20,7 +20,8 @@
 
 <!-- 顶部页签由 common.js 统一注入（三个页面共用一份，改名字只改一处） -->
 
-<main>
+<main><div class="tabs" role="tablist" aria-label="风险概览分区"><button class="tab-btn" type="button" role="tab" id="tab-btn-board" data-tab="board" aria-controls="tab-board" aria-selected="true" tabindex="0">风险看板</button><button class="tab-btn" type="button" role="tab" id="tab-btn-analysis" data-tab="analysis" aria-controls="tab-analysis" aria-selected="false" tabindex="-1">归因与治理</button></div>
+<div class="tab-panel" id="tab-board" role="tabpanel" aria-labelledby="tab-btn-board">
   <div class="stats" id="stats"></div>
 
   <section class="sec">
@@ -31,7 +32,7 @@
     <div class="tip">风险值由两部分合成：<b>设备本身</b>（温度、电流这些实测数据）和
       <b>现场情况</b>（潮湿、粉尘、淋水、检修次数这些填报内容）。哪一边高，风险都会被抬上去。
       每台卡片上的「AI 解读」看这台为什么高、怎么降；「校准工况」改现场情况，风险立即重算。
-      共性归因、治理方案、检修排期都在「智能分析」页。
+      共性归因、治理方案、检修排期都在本页的「归因与治理」页签。
       <span data-hm-note></span></div>
 
     <div class="hm-note" id="hmNote"></div>
@@ -39,6 +40,26 @@
     <div id="cardsPager"></div>
     <div class="more-row" id="cardsMore"></div>
   </section>
+</div>
+<div class="tab-panel" id="tab-analysis" role="tabpanel" aria-labelledby="tab-btn-analysis" hidden>
+  <section class="sec" id="analysis">
+    <div class="sec-hd">
+      <div class="sec-title">这一轮分析</div>
+      <div class="sec-acts">
+        <button class="btn ghost small" id="btnReanalyze" type="button" onclick="SmartAnalysis.refresh(this)">重新分析</button>
+        <a class="btn ghost small" href="/api/export?type=devices" download>导出风险清单</a>
+        <a class="btn ghost small" href="/api/export?type=actions" download>导出治理措施</a>
+        <a class="btn ghost small" href="/api/export?type=plan" download>导出检修排期</a>
+      </div>
+    </div>
+    <div class="tip">这个页签讲「为什么高、先干什么」，风险数字在「风险看板」和设备台账里看。
+      下面每一项都是按看板同一套风险公式逐项拆出来的，「降多少个百分点」是重算的结果，不是估算。
+      改完台账或校准后点「重新分析」，标题右侧的「本轮数据」时间跟着变，就说明这一轮已经重算过。
+      要文字版建议或追问原因，点「让 AI 补充建议」或右下角的「问 AI」。</div>
+
+    <div data-ai="full"></div>
+  </section>
+</div>
 </main>
 
 <footer>数据来源：设备台账 + 仿真时序 + HistGradientBoosting 模型　|　智能分析：本地规则引擎 + 云知声 Agent　|　本页只做展示与录入，不训练模型</footer>

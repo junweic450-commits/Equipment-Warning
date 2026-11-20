@@ -45,47 +45,55 @@ const MC={
     return MC.refresh();
   },
   async refresh(){
-    const status=document.getElementById("mcFilter")?.value||"pending";
+    const status=(App.byId("mcFilter")||{}).value||"pending";
     try{
       const r=await App.api("/api/model-center?status="+encodeURIComponent(status));
-      const s=r.summary||{}, counts=r.data?.counts||{};
-      MC.options=r.options||{};
-      MC.summary=s;
-      document.getElementById("mcTime").textContent="更新时间 "+new Date().toLocaleTimeString();
-      document.getElementById("mcStats").innerHTML=[
-        ["当前线上版本",s.active_version||"基础模型"],["已采集样本",s.total_samples||0],
-        ["已审核样本",s.reviewed_samples||0],["可训练反馈",s.trainable_samples||0],
-        ["待确认样本",s.pending_samples||0],["已标注故障类型",s.labeled_types||0],
-        ["已生成失效事件",s.linked_events||0],["待审批模型",s.pending_approvals||0]
-      ].map(x=>`<div class="mc-stat"><b>${App.esc(x[1])}</b><span>${App.esc(x[0])}</span></div>`).join("");
-      MC.samples=(r.data.samples)||[];
+      MC.options=r.options||{}; MC.summary=r.summary||{}; MC.health=r.health||null;
+      MC.samples=(r.data&&r.data.samples)||[];
       App.pagerState("samples").draw=MC.renderSamples;
-      MC.renderSamples();
-      const history=[...(s.history||[])];
-      if(s.active_version!=="V1.0-基础模型") history.push({version:"V1.0-基础模型",status:"published",dataset_size:"—",feedback_count:"—",metrics:{},message:"系统初始基础模型（可作为回退版本）"});
-      document.getElementById("mcHistory").innerHTML=history.map(h=>{
-        const m=h.metrics||{}, active=h.version===s.active_version;
-        const statusText={published:"已发布",pending_approval:"待管理员审批",candidate_rejected:"评估未通过"}[h.status]||h.status;
-        const statusClass=MC.pillClass(h.status);
-        let action="";
-        if(h.status==="pending_approval") action=`<button class="btn small" onclick="ModelCenter.publish('${App.esc(h.version)}')">审批并发布</button>`;
-        else if(h.status==="published"&&!active) action=`<button class="btn ghost small" onclick="ModelCenter.rollback('${App.esc(h.version)}')">回滚到此版本</button>`;
-        return `<div class="sample"><div class="sample-hd"><b>${App.esc(h.version)}</b><span class="pill ${statusClass}">${statusText}${active?" · 当前线上":""}</span></div><div class="sample-values">`+
-          MC.spans([["数据量",h.dataset_size||0],["反馈",h.feedback_count||0],
-            ["Recall",m.recall==null?"—":(m.recall*100).toFixed(1)+"%"],["Precision",m.precision==null?"—":(m.precision*100).toFixed(1)+"%"],
-            ["F1",m.f1==null?"—":m.f1.toFixed(3)],["AUC",m.roc_auc==null?"—":m.roc_auc.toFixed(3)]])+
-          `</div><div class="hint">${App.esc(h.created_at||"")} · ${App.esc(h.message||"")}${h.approved_by?" · 审批人："+App.esc(h.approved_by):""}${h.approved_at?" · 审批时间："+App.esc(h.approved_at):""}</div>${action?`<div class="btn-row" style="margin-top:10px">${action}</div>`:""}</div>`;
-      }).join("")||'<div class="empty">暂无训练记录。</div>';
-      MC.health=r.health||null;
-      const hc=document.getElementById("mcHealth");
-      if(hc) hc.innerHTML=MC.healthHTML(MC.health);
-    }catch(e){
-      /* M-c 定的顺序：先清分页条、再写错误文案，两处都加守卫。原来 mcSamples 的
-         getElementById(...).textContent= 没守卫，容器缺失时（Task 4 搬家途中）这条
-         异常会从 catch 里再抛出去——而 events.js 有三处 await MC.refresh() 落在自己的
-         try 里，会被它 :258 的 catch 误报成「没写进去：…」，看着像事件没存上。 */
-      const pe=document.getElementById("mcSamplesPager"); if(pe) pe.innerHTML="";
-      const sBox=document.getElementById("mcSamples"); if(sBox) sBox.textContent="加载失败："+e.message;}
+      MC.renderTime(); MC.renderStats(); MC.renderSamples(); MC.renderHistory(); MC.renderHealth();
+    }catch(e){MC.renderError(e.message);}
+  },
+  /* 今日核查与模型训练共用这一份脚本，各自只有其中几块容器；
+     每个渲染器第一件事都是「这页没有这块就不画」，否则 getElementById 返回 null 会
+     把整轮 refresh 抛进 catch，把正常渲染出来的样本区刷成「加载失败」。 */
+  renderTime(){ const el=App.byId("mcTime"); if(el) el.textContent="更新时间 "+new Date().toLocaleTimeString(); },
+  renderStats(){
+    const box=App.byId("mcStats"); if(!box) return;
+    const s=MC.summary||{};
+    box.innerHTML=[
+      ["当前线上版本",s.active_version||"基础模型"],["已采集样本",s.total_samples||0],
+      ["已审核样本",s.reviewed_samples||0],["可训练反馈",s.trainable_samples||0],
+      ["待确认样本",s.pending_samples||0],["已标注故障类型",s.labeled_types||0],
+      ["已生成失效事件",s.linked_events||0],["待审批模型",s.pending_approvals||0]
+    ].map(x=>`<div class="mc-stat"><b>${App.esc(x[1])}</b><span>${App.esc(x[0])}</span></div>`).join("");
+  },
+  renderHistory(){
+    const box=App.byId("mcHistory"); if(!box) return;
+    const s=MC.summary||{};
+    const history=[...(s.history||[])];
+    if(s.active_version!=="V1.0-基础模型") history.push({version:"V1.0-基础模型",status:"published",dataset_size:"—",feedback_count:"—",metrics:{},message:"系统初始基础模型（可作为回退版本）"});
+    box.innerHTML=history.map(h=>{
+      const m=h.metrics||{}, active=h.version===s.active_version;
+      const statusText={published:"已发布",pending_approval:"待管理员审批",candidate_rejected:"评估未通过"}[h.status]||h.status;
+      const statusClass=MC.pillClass(h.status);
+      let action="";
+      if(h.status==="pending_approval") action=`<button class="btn small" onclick="ModelCenter.publish('${App.esc(h.version)}')">审批并发布</button>`;
+      else if(h.status==="published"&&!active) action=`<button class="btn ghost small" onclick="ModelCenter.rollback('${App.esc(h.version)}')">回滚到此版本</button>`;
+      return `<div class="sample"><div class="sample-hd"><b>${App.esc(h.version)}</b><span class="pill ${statusClass}">${statusText}${active?" · 当前线上":""}</span></div><div class="sample-values">`+
+        MC.spans([["数据量",h.dataset_size||0],["反馈",h.feedback_count||0],
+          ["Recall",m.recall==null?"—":(m.recall*100).toFixed(1)+"%"],["Precision",m.precision==null?"—":(m.precision*100).toFixed(1)+"%"],
+          ["F1",m.f1==null?"—":m.f1.toFixed(3)],["AUC",m.roc_auc==null?"—":m.roc_auc.toFixed(3)]])+
+        `</div><div class="hint">${App.esc(h.created_at||"")} · ${App.esc(h.message||"")}${h.approved_by?" · 审批人："+App.esc(h.approved_by):""}${h.approved_at?" · 审批时间："+App.esc(h.approved_at):""}</div>${action?`<div class="btn-row" style="margin-top:10px">${action}</div>`:""}</div>`;
+    }).join("")||'<div class="empty">暂无训练记录。</div>';
+  },
+  renderHealth(){ const box=App.byId("mcHealth"); if(!box) return; box.innerHTML=MC.healthHTML(MC.health); },
+  renderError(msg){
+    const pager=App.byId("mcSamplesPager"); if(pager) pager.innerHTML="";
+    ["mcStats","mcSamples","mcHistory","mcHealth"].forEach(id=>{
+      const el=App.byId(id);
+      if(el) el.innerHTML=`<div class="warn">加载失败：${App.esc(msg)}</div>`;
+    });
   },
   /* ---------------- 分类 / 剩余寿命模型：风险概览那两列的来源 ---------------- */
   covText(m){
